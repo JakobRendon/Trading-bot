@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 OANDA v20 REST API trading bot targeting FTMO prop trading. Currently bare-bones: pulls EUR/USD data and executes trades on an OANDA practice account. No trading strategy logic yet.
 
+See `Trading_Bot_Plan.md` for the full development roadmap, strategy details, and research notes.
+
 ## Running
 
 ```bash
@@ -37,8 +39,8 @@ api.get_account_summary()
 
 ## FTMO Constraints (design around these)
 
-- Max 2,000 API requests/day
-- Max 200 simultaneous orders
-- Max 2,000 position entries/day
-- 5% max daily loss, 10% max total drawdown
-- Automated trading is allowed; HFT arbitrage is not
+- Max 2,000 API requests/day, 200 simultaneous orders, 2,000 position entries/day
+- 5% max daily loss (use 4% buffer), 10% max total drawdown (use 9% buffer)
+- Automated trading allowed; HFT arbitrage, martingale, grid, and hedging are banned
+- Streaming API does NOT count against the 2,000 request/day limit — only REST calls do
+- Funded accounts: 2-minute no-trade window before/after major news events
