@@ -87,6 +87,25 @@ def close_position():
         print_json(data)
 
 
+def transactions():
+    count = input("  Show last N transactions [10]: ").strip() or "10"
+    data = api.get_transactions()
+    txs = data.get("transactions", [])
+    if not txs:
+        print("  No transactions.")
+        return
+    recent = txs[-int(count):]
+    for tx in recent:
+        instrument = tx.get("instrument", "-")
+        units = tx.get("units", "-")
+        price = tx.get("price", "-")
+        pl = tx.get("pl", "-")
+        print(
+            f"  ID:{tx['id']}  {tx['time'][:19]}  {tx['type']:25s}  "
+            f"{instrument}  Units:{units}  Price:{price}  P/L:{pl}"
+        )
+
+
 MENU = """
 --- OANDA Trading Bot ---
 1. Account summary
@@ -95,7 +114,8 @@ MENU = """
 4. Place market order (EUR/USD)
 5. View open positions
 6. Close EUR/USD position
-7. Exit
+7. View transaction history
+8. Exit
 """
 
 ACTIONS = {
@@ -105,6 +125,7 @@ ACTIONS = {
     "4": market_order,
     "5": open_positions,
     "6": close_position,
+    "7": transactions,
 }
 
 
@@ -118,7 +139,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "7":
+        if choice == "8":
             break
         action = ACTIONS.get(choice)
         if action:

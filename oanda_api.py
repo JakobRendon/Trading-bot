@@ -63,9 +63,28 @@ class OandaAPI:
     def get_open_positions(self):
         return self._get("/openPositions")
 
+    def get_transactions(self, since_id="1"):
+        """Get all transactions with ID greater than since_id (defaults to start of account)."""
+        return self._get("/transactions/sinceid", params={"id": str(since_id)})
+
     def close_position(self, instrument):
-        """Close entire position for an instrument (both long and short)."""
-        return self._put(
-            f"/positions/{instrument}/close",
-            {"longUnits": "ALL", "shortUnits": "ALL"},
-        )
+        """Close entire position for an instrument.
+
+        OANDA rejects the request if you ask to close a side that doesn't exist,
+        so we query the position first and only include the sides that have units.
+        """
+        position = self._get(f"/positions/{instrument}")
+        pos = position.get("position", {})
+        long_units = int(pos.get("long", {}).get("units", "0"))
+        short_units = int(pos.get("short", {}).get("units", "0"))
+
+        payload = {}
+        if long_units > 0:
+            payload["longUnits"] = "ALL"
+        if short_units < 0:
+            payload["shortUnits"] = "ALL"
+
+        if not payload:
+            return {"errorMessage": f"No open position for {instrument}"}
+
+        return self._put(f"/positions/{instrument}/close", payload)
