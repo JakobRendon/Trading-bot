@@ -32,7 +32,8 @@ api.get_account_summary()
 ## OANDA API Details
 
 - Base URLs: `https://api-fxpractice.oanda.com` (practice), `https://api-fxtrade.oanda.com` (live)
-- All endpoints are under `/v3/accounts/{accountID}/...`
+- Most endpoints are under `/v3/accounts/{accountID}/...`
+- Exception: candles endpoint is `/v3/instruments/{instrument}/candles` (not under accounts)
 - Auth: Bearer token in `Authorization` header
 - Instruments use underscore format: `EUR_USD`, not `EUR/USD`
 - Order units: positive = buy (long), negative = sell (short), passed as string
@@ -41,6 +42,6 @@ api.get_account_summary()
 
 - Max 2,000 API requests/day, 200 simultaneous orders, 2,000 position entries/day
 - 5% max daily loss (use 4% buffer), 10% max total drawdown (use 9% buffer)
-- Automated trading allowed; HFT arbitrage, martingale, grid, and hedging are banned
+- Automated trading allowed; HFT arbitrage and hedging are banned; martingale/grid not explicitly banned but subject to scrutiny
 - Streaming API does NOT count against the 2,000 request/day limit — only REST calls do
 - Funded accounts: 2-minute no-trade window before/after major news events

@@ -183,9 +183,11 @@ Test strategies against historical data before risking real money.
 |------|-------|
 | FTMO daily loss | 5% (use 4% buffer) |
 | FTMO total drawdown | 10% (use 9% buffer) |
-| FTMO profit target (challenge) | 10% |
-| FTMO profit target (verification) | 5% |
+| FTMO profit target (2-step challenge) | 10% |
+| FTMO profit target (2-step verification) | 5% |
+| FTMO profit target (1-step challenge) | 10% (tighter rules: 3% daily loss, 10% trailing drawdown) |
 | FTMO min trading days | 4 |
+| FTMO challenge time limit | Unlimited (30-day cap removed) |
 | OANDA API requests/day (FTMO) | 2,000 |
 | OANDA simultaneous orders (FTMO) | 200 |
 | OANDA position entries/day (FTMO) | 2,000 |
@@ -224,3 +226,25 @@ Systematically evaluate trading strategies across all 68+ OANDA currency pairs t
 - Results feed back into the bot's config (which pairs to trade) but the scanning process is independent
 - Risk of overfitting is high — needs rigorous statistical controls (Deflated Sharpe Ratio, Bonferroni correction for multiple testing)
 - Professional quant firms run this as a separate research process, not embedded in production trading systems
+
+**FTMO + OANDA ownership change (Dec 2025):**
+FTMO acquired OANDA Group on December 1, 2025. OANDA's own Prop Trader programme was discontinued March 31, 2026. Key implications:
+- The OANDA v20 API is still active and unchanged — our code continues to work
+- FTMO traders are migrating to `ftmo.oanda.com` as the unified platform
+- Verify that practice account credentials still work before starting development; may need to set up through the new FTMO x OANDA portal
+- Execution now routes through FTMO Group internally rather than third-party
+
+**FTMO rule changes (updated May 2026):**
+- New 1-Step Challenge option (Feb 2026): 10% target, single phase, but 3% daily loss limit and 10% trailing drawdown
+- Challenge time limit removed — unlimited time to hit profit target
+- Martingale/grid no longer explicitly banned, but subject to closer scrutiny (we still avoid them)
+- Swing accounts now allow full news trading (no 2-minute restriction)
+- MetaTrader 5 and TradingView added as official platform options
+
+**Strategy landscape (updated May 2026):**
+- London Breakout still effective: May 2025 GBP/USD backtest showed 52.6% win rate, 1.74 profit factor
+- New detail: skip London Breakout setups where Asian range is narrower than 80 pips on GBP/USD
+- Mean Reversion still viable: MACD + Bollinger Bands showing 78% win rate in recent backtests
+- EUR/GBP still range-bound (€1.14–1.16), confirming suitability for mean reversion
+- Spreads expected to widen in 2026 — backtests should use realistic current spread data
+- Fair Value Gap (FVG) and Smart Money Concepts (SMC) strategies gaining traction — consider as future strategy additions

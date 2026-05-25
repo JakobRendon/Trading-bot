@@ -13,20 +13,24 @@ class OandaAPI:
     def _url(self, path):
         return f"{self.base_url}/v3/accounts/{self.account_id}{path}"
 
-    def _get(self, path, params=None):
-        resp = requests.get(self._url(path), headers=self.headers, params=params)
+    def _base_url(self, path):
+        return f"{self.base_url}/v3{path}"
+
+    def _get(self, path, params=None, use_base=False):
+        url = self._base_url(path) if use_base else self._url(path)
+        resp = requests.get(url, headers=self.headers, params=params, timeout=10)
         if not resp.ok:
             print(f"ERROR {resp.status_code}: {resp.text}")
         return resp.json()
 
     def _post(self, path, data):
-        resp = requests.post(self._url(path), headers=self.headers, json=data)
+        resp = requests.post(self._url(path), headers=self.headers, json=data, timeout=10)
         if not resp.ok:
             print(f"ERROR {resp.status_code}: {resp.text}")
         return resp.json()
 
     def _put(self, path, data):
-        resp = requests.put(self._url(path), headers=self.headers, json=data)
+        resp = requests.put(self._url(path), headers=self.headers, json=data, timeout=10)
         if not resp.ok:
             print(f"ERROR {resp.status_code}: {resp.text}")
         return resp.json()
@@ -38,6 +42,7 @@ class OandaAPI:
         return self._get(
             f"/instruments/{instrument}/candles",
             params={"granularity": granularity, "count": count},
+            use_base=True,
         )
 
     def get_price(self, instrument):
