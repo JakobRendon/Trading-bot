@@ -9,6 +9,7 @@ from risk import position_size, validate_risk_reward
 from risk_guard import FTMORiskGuard
 from strategy import FixedSignalStrategy
 from strategy_runner import StrategyRunner
+from london_breakout import LondonBreakoutStrategy
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
@@ -276,10 +277,15 @@ def stream_candles():
 def run_strategy():
     """Run a strategy in paper mode against the live stream.
 
-    Currently uses FixedSignalStrategy (emits a long signal on every M1 candle
-    close) for wiring verification. Phase 5 follow-up slices will add real
-    strategies (London Breakout, Mean Reversion).
+    Choose between the wiring-verification FixedSignalStrategy (emits every
+    candle close, useful for short-session debugging) and LondonBreakoutStrategy
+    (real strategy; fires at most once per day during 08:00-10:00 UTC).
     """
+    print("  Strategies:")
+    print("    1. FixedSignalStrategy (M1, wiring test — fires every candle)")
+    print("    2. LondonBreakoutStrategy (M15, real — fires 08-10 UTC max once/day)")
+    choice = input("  Pick [1]: ").strip() or "1"
+
     duration_input = input("  Run for how many seconds? [120]: ").strip() or "120"
     try:
         duration = int(duration_input)
@@ -287,12 +293,18 @@ def run_strategy():
         print("  Invalid duration.")
         return
 
-    print("  Running FixedSignalStrategy in PAPER mode (no real orders).")
-    strategy = FixedSignalStrategy(instrument=INSTRUMENT, granularity="M1")
-    runner = StrategyRunner(api, guard, strategy, paper=True)
+    if choice == "2":
+        strategy = LondonBreakoutStrategy(instrument=INSTRUMENT)
+        print(f"  Running LondonBreakoutStrategy on {INSTRUMENT} (M15) in PAPER mode.")
+        granularities = ["M15"]
+    else:
+        strategy = FixedSignalStrategy(instrument=INSTRUMENT, granularity="M1")
+        print(f"  Running FixedSignalStrategy on {INSTRUMENT} (M1) in PAPER mode.")
+        granularities = ["M1"]
 
+    runner = StrategyRunner(api, guard, strategy, paper=True)
     stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
-    aggregator = CandleAggregator(["M1"])
+    aggregator = CandleAggregator(granularities)
     aggregator.on_candle_close(runner.on_candle_close)
     stream.on_price(aggregator.on_tick)
 
@@ -310,7 +322,7 @@ def run_strategy():
     for event in runner.activity:
         if event["type"] == "paper":
             sig = event["signal"]
-            print(f"    PAPER {sig.direction} SL:{sig.stop_loss_pips} TP:{sig.take_profit_pips}")
+            print(f"    PAPER {sig.direction} SL:{sig.stop_loss_pips} TP:{sig.take_profit_pips} ({sig.reason})")
         elif event["type"] == "blocked":
             print(f"    BLOCKED ({event['reason']})")
         else:
