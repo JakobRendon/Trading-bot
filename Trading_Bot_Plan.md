@@ -6,8 +6,15 @@ Target: FTMO prop trading via OANDA v20 API. Starting with $25k challenge, scali
 
 ## Phase 1: Core API Client ✅ DONE
 - OANDA v20 REST API connection (direct HTTP, no wrapper library)
-- Account summary, candle data, pricing, market orders, position management
+- Account summary, candle data, pricing, market orders, position management, transactions
 - Practice environment with configurable live switch
+- Test suite (unit, integration, live trade) — 34 tests total
+
+**Deferred API methods (add when consuming phase needs them):**
+- Orders with attached SL/TP (needed for Phase 3 risk management)
+- Date-range candle fetching (needed for Phase 6 backtesting — current method only does "last N candles")
+- List tradeable instruments via `/v3/accounts/{id}/instruments` (needed for Phase 5 multi-pair support)
+- Modify/cancel pending orders (needed when we add limit orders)
 
 ---
 

@@ -5,9 +5,11 @@ Requires .env with valid credentials. Read-only calls only (no trades placed).
 Run with: pytest tests/test_integration.py -v
 """
 
+import threading
 import pytest
 import config
 from oanda_api import OandaAPI
+from oanda_stream import OandaStream
 
 needs_credentials = pytest.mark.skipif(
     not config.API_TOKEN or not config.ACCOUNT_ID,
@@ -74,6 +76,39 @@ class TestPositions:
         data = api.get_open_positions()
         assert "positions" in data
         assert isinstance(data["positions"], list)
+
+
+@needs_credentials
+class TestStreaming:
+    def test_stream_receives_price_ticks(self):
+        """Connect to the live stream and verify at least one PRICE event arrives.
+
+        Markets must be open for this to pass. Uses a 60s safety timeout so
+        the test never hangs indefinitely.
+        """
+        stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+        received = []
+
+        def on_price(data):
+            received.append(data)
+            if len(received) >= 2:
+                stream.stop()
+
+        stream.on_price(on_price)
+
+        timer = threading.Timer(60.0, stream.stop)
+        timer.start()
+        try:
+            stream.start(["EUR_USD"])
+        finally:
+            timer.cancel()
+
+        assert len(received) >= 1, "No price ticks received (markets closed?)"
+        tick = received[0]
+        assert tick["type"] == "PRICE"
+        assert tick["instrument"] == "EUR_USD"
+        assert "bids" in tick
+        assert "asks" in tick
 
 
 @needs_credentials

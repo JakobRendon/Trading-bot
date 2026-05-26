@@ -1,6 +1,8 @@
 import json
+import threading
 import config
 from oanda_api import OandaAPI
+from oanda_stream import OandaStream
 
 INSTRUMENT = "EUR_USD"
 
@@ -87,6 +89,30 @@ def close_position():
         print_json(data)
 
 
+def stream_prices():
+    duration = input("  Stream for how many seconds? [10]: ").strip() or "10"
+    duration = int(duration)
+    stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+
+    def on_price(tick):
+        bid = tick["bids"][0]["price"]
+        ask = tick["asks"][0]["price"]
+        print(f"  {tick['time'][:19]}  {tick['instrument']}  Bid: {bid}  Ask: {ask}")
+
+    stream.on_price(on_price)
+    print(f"  Streaming EUR/USD prices for {duration}s (Ctrl+C to stop early)...")
+
+    timer = threading.Timer(duration, stream.stop)
+    timer.start()
+    try:
+        stream.start(["EUR_USD"])
+    except KeyboardInterrupt:
+        stream.stop()
+    finally:
+        timer.cancel()
+    print("  Stream stopped.")
+
+
 def transactions():
     count = input("  Show last N transactions [10]: ").strip() or "10"
     data = api.get_transactions()
@@ -115,7 +141,8 @@ MENU = """
 5. View open positions
 6. Close EUR/USD position
 7. View transaction history
-8. Exit
+8. Stream live EUR/USD prices
+9. Exit
 """
 
 ACTIONS = {
@@ -126,6 +153,7 @@ ACTIONS = {
     "5": open_positions,
     "6": close_position,
     "7": transactions,
+    "8": stream_prices,
 }
 
 
@@ -139,7 +167,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "8":
+        if choice == "9":
             break
         action = ACTIONS.get(choice)
         if action:
