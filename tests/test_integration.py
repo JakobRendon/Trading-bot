@@ -6,14 +6,35 @@ Run with: pytest tests/test_integration.py -v
 """
 
 import threading
+from datetime import datetime, timezone
 import pytest
 import config
 from oanda_api import OandaAPI
 from oanda_stream import OandaStream
+from candle_aggregator import CandleAggregator
 
 needs_credentials = pytest.mark.skipif(
     not config.API_TOKEN or not config.ACCOUNT_ID,
     reason="Missing OANDA credentials in .env",
+)
+
+
+def _forex_market_open():
+    """Forex is closed Friday 21:00 UTC through Sunday 21:00 UTC."""
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Mon=0 ... Sun=6
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 4 and now.hour >= 21:  # Friday after 21:00 UTC
+        return False
+    if weekday == 6 and now.hour < 21:  # Sunday before 21:00 UTC
+        return False
+    return True
+
+
+needs_market_open = pytest.mark.skipif(
+    not _forex_market_open(),
+    reason="Forex market closed (weekend) — streaming tests need live ticks",
 )
 
 @pytest.fixture
@@ -29,9 +50,10 @@ class TestAccountConnection:
         assert "balance" in acct
         assert float(acct["balance"]) > 0
 
-    def test_account_summary_returns_currency(self, api):
+    def test_account_summary_has_currency(self, api):
         data = api.get_account_summary()
-        assert data["account"]["currency"] == "USD"
+        # Practice accounts can be in various base currencies — don't hardcode USD
+        assert "currency" in data["account"]
 
 
 @needs_credentials
@@ -53,7 +75,9 @@ class TestCandles:
     def test_get_candles_returns_data(self, api):
         data = api.get_candles("EUR_USD", "H1", 5)
         assert "candles" in data
-        assert len(data["candles"]) == 5
+        # OANDA returns fewer when the window includes market-closed periods,
+        # so accept any non-empty result up to the requested count
+        assert 1 <= len(data["candles"]) <= 5
 
     def test_candle_has_ohlc(self, api):
         data = api.get_candles("EUR_USD", "H1", 1)
@@ -79,6 +103,7 @@ class TestPositions:
 
 
 @needs_credentials
+@needs_market_open
 class TestStreaming:
     def test_stream_receives_price_ticks(self):
         """Connect to the live stream and verify at least one PRICE event arrives.
@@ -99,7 +124,7 @@ class TestStreaming:
         timer = threading.Timer(60.0, stream.stop)
         timer.start()
         try:
-            stream.start(["EUR_USD"])
+            stream.start(["EUR_USD"], max_reconnects=2)
         finally:
             timer.cancel()
 
@@ -109,6 +134,48 @@ class TestStreaming:
         assert tick["instrument"] == "EUR_USD"
         assert "bids" in tick
         assert "asks" in tick
+
+
+@needs_credentials
+@needs_market_open
+class TestCandleAggregation:
+    def test_live_stream_produces_m1_candle_close(self):
+        """Stream EUR/USD ticks and wait for an M1 candle to close.
+
+        Markets must be open. Waits up to 90s for at least one candle close.
+        """
+        stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+        aggregator = CandleAggregator(["M1"])
+        closed_candles = []
+
+        def on_close(granularity, candle):
+            closed_candles.append((granularity, candle))
+            stream.stop()
+
+        aggregator.on_candle_close(on_close)
+        stream.on_price(aggregator.on_tick)
+
+        timer = threading.Timer(90.0, stream.stop)
+        timer.start()
+        try:
+            stream.start(["EUR_USD"], max_reconnects=2)
+        finally:
+            timer.cancel()
+
+        assert len(closed_candles) >= 1, "No M1 candle closed within 90s (markets closed?)"
+        granularity, candle = closed_candles[0]
+        assert granularity == "M1"
+        assert candle["instrument"] == "EUR_USD"
+        # Volume should be a positive count of ticks received in the bucket
+        assert candle["volume"] > 0
+        # OHLC values should all be within reasonable EUR/USD range
+        for field in ("open", "high", "low", "close"):
+            assert 0.5 < candle[field] < 2.0
+        # H >= O,C >= L invariant
+        assert candle["high"] >= candle["open"]
+        assert candle["high"] >= candle["close"]
+        assert candle["low"] <= candle["open"]
+        assert candle["low"] <= candle["close"]
 
 
 @needs_credentials

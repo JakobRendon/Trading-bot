@@ -255,3 +255,33 @@ FTMO acquired OANDA Group on December 1, 2025. OANDA's own Prop Trader programme
 - EUR/GBP still range-bound (€1.14–1.16), confirming suitability for mean reversion
 - Spreads expected to widen in 2026 — backtests should use realistic current spread data
 - Fair Value Gap (FVG) and Smart Money Concepts (SMC) strategies gaining traction — consider as future strategy additions
+
+---
+
+## Known Issues & Future Cleanup
+
+Identified during a multi-agent code review (May 2026). These don't block development but should be addressed before going live or before they bite in later phases.
+
+**Code quality / robustness:**
+- **Transaction pagination unhandled** — `get_transactions(since_id="0")` returns the full account history in one shot. OANDA caps responses at ~1000 transactions and uses pagination via the `pages` field for larger histories. Once the practice account has run long enough, history will be silently truncated. Fix: walk pagination until empty.
+- **`mid_price` Decimal precision drift on JPY pairs** — `(bid+ask)/2` for 3dp prices like JPY produces an artificial 4th decimal. Doesn't affect candle math itself, but downstream code comparing aggregator prices to broker prices may never see equality. Fix: quantize result to the instrument's display precision.
+- **CandleAggregator skips empty buckets during gaps** — During weekends/halts, intermediate buckets (e.g., M5 candles at 02:05, 02:10, 02:15) are never emitted. Strategies counting "last N candles" will see invisible gaps. Fix: when a tick arrives in a much-later bucket, emit empty/flat candles for all skipped buckets between.
+- **No `requests.Session()` for connection reuse** — Each REST call opens a fresh TCP/TLS connection (~50ms latency). For strategy code firing rapid requests this matters. Fix: share a `Session` across `_get`/`_post`/`_put`.
+- **`parse_tick_time` fragile if OANDA ever sends offset-format timestamps** — Current code uses `rstrip("Z")` then `.replace(tzinfo=UTC)`. If OANDA ever returns `+00:00` style, the replace silently clobbers any non-UTC offset. Theoretical right now. Fix: use `datetime.fromisoformat()` properly without the strip/replace pattern (Python 3.11+ accepts `Z` directly).
+- **`OANDA_ENVIRONMENT` accepts any value as practice** — Case-sensitive, no validation. A typo like `Practice` or `production` silently routes to the practice environment. Fix: validate against `{"practice", "live"}` and raise on unknown.
+- **No User-Agent header on REST calls** — Many brokers prefer one for debugging on their side. Not required, but courteous.
+
+**Test gaps:**
+- **No test for high tick rate / all granularities at once** — All aggregator tests use 1–4 ticks. A stress test with hundreds of ticks across `M1/M5/M15/M30/H1/H4/D` simultaneously would catch precision drift, performance issues, and bucket-tracking bugs.
+- **No test for `stop()` interrupting blocking `iter_lines()`** — Current tests use synchronous mocks, so `stop()` always takes effect on the next mocked event. Real-world `stop()` from another thread while the stream is blocked on a quiet socket won't take effect until the next event or the 10s heartbeat timeout. Worth a test using a slow generator mock.
+- **No test for malformed partial JSON lines mid-stream** — Current "invalid json" test uses obviously bad input. A more realistic case is a truncated event like `{"type": "PRI` from a torn chunk. Add a test for that.
+
+**Documentation:**
+- Plan claims "34 tests total" in Phase 1 section — actual count is now 90+. Update when convenient.
+- Volume semantics in candles: aggregator counts ticks, OANDA's REST candles count trades. Phase 6 backtesting will mix these data sources — document the difference clearly when implementing the backtester.
+
+**Phase 1 deferred items (intentionally not implemented yet):**
+- Orders with attached SL/TP (build during Phase 3 risk management)
+- Date-range candle fetching (build during Phase 6 backtesting)
+- List tradeable instruments via `/v3/accounts/{id}/instruments` (build during Phase 5 multi-pair work)
+- Modify/cancel pending orders (build when limit orders are added)

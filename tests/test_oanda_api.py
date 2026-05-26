@@ -1,5 +1,7 @@
+import json
 from unittest.mock import patch, MagicMock
-from oanda_api import OandaAPI
+import pytest
+from oanda_api import OandaAPI, OandaAPIError
 
 BASE = "https://api-fxpractice.oanda.com"
 TOKEN = "fake-token"
@@ -12,10 +14,11 @@ def make_api():
 
 def mock_response(json_data, status_code=200):
     resp = MagicMock()
-    resp.ok = status_code == 200
+    # `requests.Response.ok` is True for any 2xx, not just 200
+    resp.ok = 200 <= status_code < 300
     resp.status_code = status_code
     resp.json.return_value = json_data
-    resp.text = str(json_data)
+    resp.text = json.dumps(json_data)
     return resp
 
 
@@ -90,11 +93,13 @@ class TestRequestParams:
 
 class TestTransactions:
     @patch("oanda_api.requests.get", return_value=mock_response({"transactions": []}))
-    def test_default_since_id_is_1(self, mock_get):
+    def test_default_since_id_is_0(self, mock_get):
+        """since_id='0' returns ALL transactions including ID 1 (account creation).
+        Previously defaulted to '1' which silently skipped the first transaction."""
         api = make_api()
         api.get_transactions()
         params = mock_get.call_args[1]["params"]
-        assert params["id"] == "1"
+        assert params["id"] == "0"
 
     @patch("oanda_api.requests.get", return_value=mock_response({"transactions": []}))
     def test_custom_since_id_converted_to_string(self, mock_get):
@@ -123,6 +128,7 @@ class TestOrderPayload:
         assert payload["order"]["instrument"] == "EUR_USD"
         assert payload["order"]["units"] == "100"
         assert payload["order"]["timeInForce"] == "FOK"
+        assert payload["order"]["positionFill"] == "DEFAULT"
 
     @patch("oanda_api.requests.post", return_value=mock_response({"orderFillTransaction": {}}))
     def test_market_order_sell_negative_units(self, mock_post):
@@ -182,8 +188,19 @@ class TestClosePosition:
     def test_close_no_position_skips_put_call(self, mock_get, mock_put):
         api = make_api()
         result = api.close_position("EUR_USD")
+        mock_get.assert_called_once()  # position query must have happened
         mock_put.assert_not_called()
-        assert "errorMessage" in result
+        assert result.get("noPosition") is True
+        assert result.get("instrument") == "EUR_USD"
+
+    @patch("oanda_api.requests.get", return_value=mock_response({"errorMessage": "Unauthorized"}, 401))
+    def test_close_propagates_position_query_failure(self, mock_get):
+        """If the position query fails (e.g. auth), close_position should raise,
+        not silently return 'no position'."""
+        api = make_api()
+        with pytest.raises(OandaAPIError) as exc_info:
+            api.close_position("EUR_USD")
+        assert exc_info.value.status_code == 401
 
     @patch("oanda_api.requests.put", return_value=mock_response({}))
     @patch("oanda_api.requests.get", return_value=position_response(long_units=100))
@@ -221,14 +238,35 @@ class TestTimeouts:
 
 class TestErrorHandling:
     @patch("oanda_api.requests.get", return_value=mock_response({"errorMessage": "Invalid"}, 401))
-    def test_get_prints_error_on_failure(self, mock_get, capsys):
+    def test_get_raises_on_401(self, mock_get):
         api = make_api()
-        api.get_account_summary()
-        captured = capsys.readouterr()
-        assert "ERROR 401" in captured.out
+        with pytest.raises(OandaAPIError) as exc_info:
+            api.get_account_summary()
+        assert exc_info.value.status_code == 401
 
-    @patch("oanda_api.requests.get", return_value=mock_response({"errorMessage": "Invalid"}, 401))
-    def test_get_still_returns_json_on_error(self, mock_get):
+    @patch("oanda_api.requests.get", return_value=mock_response({"errorMessage": "Rate limited"}, 429))
+    def test_get_raises_on_429(self, mock_get):
         api = make_api()
-        result = api.get_account_summary()
-        assert result == {"errorMessage": "Invalid"}
+        with pytest.raises(OandaAPIError) as exc_info:
+            api.get_account_summary()
+        assert exc_info.value.status_code == 429
+
+    @patch("oanda_api.requests.get", return_value=mock_response({"err": "boom"}, 503))
+    def test_get_raises_on_5xx(self, mock_get):
+        api = make_api()
+        with pytest.raises(OandaAPIError) as exc_info:
+            api.get_account_summary()
+        assert exc_info.value.status_code == 503
+
+    @patch("oanda_api.requests.post", return_value=mock_response({"orderRejectTransaction": {}}, 400))
+    def test_post_raises_on_400(self, mock_post):
+        api = make_api()
+        with pytest.raises(OandaAPIError):
+            api.place_market_order("EUR_USD", 100)
+
+    @patch("oanda_api.requests.post", return_value=mock_response({"orderFillTransaction": {}}, 201))
+    def test_2xx_accepted_not_just_200(self, mock_post):
+        """OANDA returns 201 for POST /orders on success — mock_response must accept any 2xx."""
+        api = make_api()
+        result = api.place_market_order("EUR_USD", 100)
+        assert result == {"orderFillTransaction": {}}
