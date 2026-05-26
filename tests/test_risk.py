@@ -91,6 +91,29 @@ class TestPositionSize:
         result = position_size(10000, 1, 30, "USD_JPY", quote_to_account_rate=Decimal("0.00667"))
         assert 49000 < result < 51000
 
+    def test_cross_currency_pair_requires_explicit_rate(self):
+        """No more silent default-to-1 for non-matching quote currency."""
+        with pytest.raises(ValueError, match="quote_to_account_rate"):
+            position_size(10000, 1, 30, "USD_JPY")  # USD account, JPY quote — needs rate
+
+    def test_matching_quote_currency_does_not_require_rate(self):
+        """EUR_USD on USD account: no rate needed (quote == account)."""
+        # Should not raise
+        result = position_size(10000, 1, 30, "EUR_USD")
+        assert result > 0
+
+    def test_custom_account_currency_supported(self):
+        """EUR account trading EUR_USD: quote is USD, account is EUR — needs rate."""
+        with pytest.raises(ValueError):
+            position_size(10000, 1, 30, "EUR_USD", account_currency="EUR")
+        # With explicit rate: passes
+        result = position_size(
+            10000, 1, 30, "EUR_USD",
+            account_currency="EUR",
+            quote_to_account_rate=Decimal("0.92"),
+        )
+        assert result > 0
+
     def test_returns_int(self):
         result = position_size(10000, 1, 30, "EUR_USD")
         assert isinstance(result, int)

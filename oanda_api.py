@@ -1,6 +1,7 @@
+import threading
 import time
 import requests
-from risk import pip_distance, generate_client_id
+from risk import pip_distance, generate_client_id, validate_risk_reward
 
 
 # Per OANDA best practices, separate connect/read timeouts. The read timeout
@@ -47,6 +48,13 @@ class OandaAPI:
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
         })
+        # Cumulative count of REST requests made through this client. Used by
+        # FTMORiskGuard to enforce the 2,000-req/day FTMO ceiling. Streaming
+        # connections don't increment this — they go through OandaStream.
+        # Counter increments after the response is received (network errors
+        # don't count — OANDA never saw them).
+        self.request_count = 0
+        self._count_lock = threading.Lock()
 
     def close(self):
         """Release the underlying connection pool. Call at shutdown."""
@@ -77,9 +85,13 @@ class OandaAPI:
         a timed-out order may have actually filled.
         """
         for attempt in range(2):
+            # Increment AFTER the call completes — network errors that never
+            # reached OANDA don't count against our daily budget.
             resp = self.session.request(
                 method, url, params=params, json=json, timeout=timeout
             )
+            with self._count_lock:
+                self.request_count += 1
             if resp.status_code == 429 and attempt == 0:
                 retry_after = resp.headers.get("Retry-After", "1")
                 try:
@@ -121,14 +133,20 @@ class OandaAPI:
         take_profit_pips=None,
         price_bound=None,
         client_id=None,
+        allow_naked=False,
     ):
         """Place a market order. Positive units = buy, negative = sell.
 
-        Optional risk controls:
+        SL is required by default (the Phase 3 "no naked positions" rule).
+        To explicitly opt out (e.g., for closing trades that don't need SL),
+        pass allow_naked=True.
+
+        Risk controls:
         - stop_loss_pips: distance-form SL attached atomically with the fill.
           OANDA computes the SL price as `fill ± distance` server-side, so
           there's no race between the fill arriving and the SL being set.
-        - take_profit_pips: distance-form TP, same atomic guarantee.
+        - take_profit_pips: distance-form TP. If set, the plan's 1:1.5
+          minimum R:R is enforced.
         - price_bound: absolute price string. If the fill would happen at a
           worse price than this, OANDA rejects with PRICE_BOUNDS_VIOLATION
           rather than filling at the worse price (slippage cap).
@@ -136,12 +154,23 @@ class OandaAPI:
           `GET /orders/@client_id` lookup so a network-timed-out POST can be
           checked rather than blindly retried.
 
-        Raises OandaOrderRejected if OANDA returns 2xx with an
-        orderRejectTransaction in the body (validation failure).
+        Raises:
+        - ValueError if SL is missing and allow_naked is False
+        - ValueError if R:R ratio is below 1:1.5 when both SL and TP are set
+        - OandaOrderRejected if OANDA returns 2xx with an
+          orderRejectTransaction in the body (validation failure)
 
         Returns the raw response. Callers should check for `orderFillTransaction`
         (filled) vs `orderCancelTransaction` (FOK couldn't fill at requested price).
         """
+        if stop_loss_pips is None and not allow_naked:
+            raise ValueError(
+                "stop_loss_pips is required (no naked positions). "
+                "Pass allow_naked=True to explicitly override."
+            )
+        if stop_loss_pips is not None and take_profit_pips is not None:
+            validate_risk_reward(stop_loss_pips, take_profit_pips)
+
         order = {
             "type": "MARKET",
             "instrument": instrument,

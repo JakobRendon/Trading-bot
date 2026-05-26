@@ -21,3 +21,13 @@ def _parse_list(env_var, default):
 
 INSTRUMENTS = _parse_list("OANDA_INSTRUMENTS", "EUR_USD")
 GRANULARITIES = _parse_list("OANDA_GRANULARITIES", "M5,M15,H1,H4")
+
+# FTMO risk thresholds — see Trading_Bot_Plan.md for sourcing.
+# Buffers are deliberately below FTMO's hard limits to leave headroom.
+RISK_STATE_PATH = os.getenv("RISK_STATE_PATH", "risk_state.json")
+CHALLENGE_START_BALANCE = os.getenv("CHALLENGE_START_BALANCE") or None
+DAILY_LOSS_BUFFER_PCT = float(os.getenv("DAILY_LOSS_BUFFER_PCT", "4"))
+TOTAL_DRAWDOWN_BUFFER_PCT = float(os.getenv("TOTAL_DRAWDOWN_BUFFER_PCT", "9"))
+MAX_REQUESTS_PER_DAY = int(os.getenv("MAX_REQUESTS_PER_DAY", "1900"))
+MAX_POSITION_ENTRIES_PER_DAY = int(os.getenv("MAX_POSITION_ENTRIES_PER_DAY", "1900"))
+MAX_SIMULTANEOUS_POSITIONS = int(os.getenv("MAX_SIMULTANEOUS_POSITIONS", "180"))

@@ -6,12 +6,24 @@ from oanda_api import OandaAPI, OandaAPIError, OandaOrderRejected
 from oanda_stream import OandaStream
 from candle_aggregator import CandleAggregator
 from risk import position_size, validate_risk_reward
+from risk_guard import FTMORiskGuard
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
 INSTRUMENT = config.INSTRUMENTS[0]
 
 api = OandaAPI(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+
+guard = FTMORiskGuard(
+    api,
+    state_path=config.RISK_STATE_PATH,
+    challenge_start_balance=config.CHALLENGE_START_BALANCE,
+    daily_loss_buffer_pct=config.DAILY_LOSS_BUFFER_PCT,
+    total_drawdown_buffer_pct=config.TOTAL_DRAWDOWN_BUFFER_PCT,
+    max_requests_per_day=config.MAX_REQUESTS_PER_DAY,
+    max_position_entries_per_day=config.MAX_POSITION_ENTRIES_PER_DAY,
+    max_simultaneous_positions=config.MAX_SIMULTANEOUS_POSITIONS,
+)
 
 
 def print_json(data):
@@ -93,17 +105,22 @@ def _prompt_float(prompt, default=None, min_value=None):
 
 @safe
 def market_order():
+    allowed, reason = guard.can_open_position()
+    if not allowed:
+        print(f"  Risk guard blocks new positions: {reason}")
+        return
+
     direction = input("  Buy or Sell? (buy/sell): ").strip().lower()
     if direction not in ("buy", "sell"):
         print("  Invalid direction.")
         return
 
+    # Auto-fetch current NAV — no error-prone manual entry.
+    nav = float(guard.summary()["current_nav"])
+    print(f"  Current NAV: {nav}")
+
     use_sizing = input("  Auto-size from risk %? (y/n) [y]: ").strip().lower() or "y"
     if use_sizing == "y":
-        balance = _prompt_float("  Account balance (e.g. 25000): ", min_value=1)
-        if balance is None:
-            print("  Invalid balance.")
-            return
         risk_pct = _prompt_float("  Risk % per trade [1.0]: ", default=1.0, min_value=0.01)
         if risk_pct is None:
             print("  Invalid risk %.")
@@ -112,7 +129,7 @@ def market_order():
         if sl_pips is None:
             print("  Invalid SL pips.")
             return
-        units = position_size(balance, risk_pct, sl_pips, INSTRUMENT)
+        units = position_size(nav, risk_pct, sl_pips, INSTRUMENT)
         if units == 0:
             print("  Computed position size is 0 — increase risk % or reduce SL.")
             return
@@ -122,33 +139,30 @@ def market_order():
         if units is None:
             print("  Invalid units.")
             return
-        sl_pips = _prompt_int("  Stop-loss in pips (blank for none): ", default=0)
-        sl_pips = sl_pips if sl_pips and sl_pips > 0 else None
+        # SL is required by Phase 3 "no naked positions" rule
+        sl_pips = _prompt_int("  Stop-loss in pips [30]: ", default=30, min_value=1)
+        if sl_pips is None:
+            print("  Invalid SL pips.")
+            return
 
     tp_pips = _prompt_int("  Take-profit in pips (blank for none): ", default=0)
     tp_pips = tp_pips if tp_pips and tp_pips > 0 else None
-
-    # Enforce 1:1.5 minimum reward-to-risk if both SL and TP are set
-    if sl_pips and tp_pips:
-        try:
-            validate_risk_reward(sl_pips, tp_pips)
-        except ValueError as e:
-            print(f"  {e}")
-            return
 
     if direction == "sell":
         units = -units
 
     print(
         f"  Placing {'BUY' if units > 0 else 'SELL'} order for {abs(units)} units of {INSTRUMENT} "
-        f"(SL: {sl_pips or '-'} pips, TP: {tp_pips or '-'} pips)..."
+        f"(SL: {sl_pips} pips, TP: {tp_pips or '-'} pips)..."
     )
+    # place_market_order enforces SL-required and R:R rules internally
     data = api.place_market_order(
         INSTRUMENT, units, stop_loss_pips=sl_pips, take_profit_pips=tp_pips
     )
     if "orderFillTransaction" in data:
         fill = data["orderFillTransaction"]
         print(f"  Filled at: {fill.get('price')}  P/L: {fill.get('pl')}")
+        guard.record_position_entry()
     elif "orderCancelTransaction" in data:
         cancel = data["orderCancelTransaction"]
         print(f"  Order cancelled (not filled): {cancel.get('reason')}")
@@ -257,6 +271,22 @@ def stream_candles():
 
 
 @safe
+def risk_status():
+    s = guard.summary()
+    allowed, reason = guard.can_open_position()
+    print(f"  Challenge start balance: {s['challenge_start_balance']}")
+    print(f"  Daily start balance:     {s['daily_start_balance']}")
+    print(f"  Current NAV:             {s['current_nav']}")
+    print(f"  Daily P/L:               {s['daily_pl']}")
+    print(f"  Daily loss %:            {s['daily_loss_pct']}%  (buffer {guard.daily_loss_buffer_pct}%)")
+    print(f"  Total drawdown %:        {s['total_drawdown_pct']}%  (buffer {guard.total_drawdown_buffer_pct}%)")
+    print(f"  Daily requests:          {s['daily_requests']} / {s['max_requests_per_day']}")
+    print(f"  Daily entries:           {s['daily_entries']} / {s['max_entries_per_day']}")
+    print(f"  Open positions:          {s['open_positions']} / {s['max_simultaneous']}")
+    print(f"  Trading allowed:         {'YES' if allowed else f'NO ({reason})'}")
+
+
+@safe
 def transactions():
     count_input = input("  Show last N transactions [10]: ").strip() or "10"
     try:
@@ -292,7 +322,8 @@ MENU = """
 7. View transaction history
 8. Stream live prices
 9. Stream + aggregate candles
-10. Exit
+10. Risk status
+11. Exit
 """
 
 ACTIONS = {
@@ -305,6 +336,7 @@ ACTIONS = {
     "7": transactions,
     "8": stream_prices,
     "9": stream_candles,
+    "10": risk_status,
 }
 
 
@@ -320,7 +352,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "10":
+        if choice == "11":
             break
         action = ACTIONS.get(choice)
         if action:

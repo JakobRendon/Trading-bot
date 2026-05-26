@@ -40,16 +40,27 @@ def pip_distance(instrument, pips):
     return f"{distance:.{precision}f}"
 
 
-def position_size(balance, risk_pct, stop_loss_pips, instrument, quote_to_account_rate=Decimal("1")):
+def position_size(
+    balance,
+    risk_pct,
+    stop_loss_pips,
+    instrument,
+    account_currency="USD",
+    quote_to_account_rate=None,
+):
     """Compute position size in units.
 
     Formula: units = (balance * risk%) / (stop_loss_pips * pip_size * quote_to_account_rate)
 
-    Assumes account currency == quote currency by default (quote_to_account_rate=1).
-    Correct for pairs like EUR_USD or GBP_USD on a USD-denominated account.
-    For pairs where the quote currency differs from the account currency
-    (e.g., USD_JPY on a USD account: quote is JPY), pass the current rate
-    quoting the conversion from quote to account currency.
+    The instrument's quote currency (e.g., USD in EUR_USD, JPY in USD_JPY)
+    determines whether a conversion factor is needed:
+    - If quote currency == account_currency: factor is 1 automatically.
+    - If they differ: quote_to_account_rate is REQUIRED (no silent default to 1).
+      Pass the current rate quoting "1 quote_currency in account_currency".
+      Example: USD_JPY on USD account → pass ~0.0067 (i.e., 1/USDJPY rate).
+
+    Raises ValueError if the rate is needed but not provided — silent default-to-1
+    would mis-size by orders of magnitude on cross-currency pairs.
 
     Returns an int — OANDA accepts fractional units on some pairs, but
     integer rounding keeps sizing predictable and avoids precision footguns.
@@ -59,8 +70,20 @@ def position_size(balance, risk_pct, stop_loss_pips, instrument, quote_to_accoun
     if risk_pct <= 0:
         raise ValueError("risk_pct must be positive")
 
+    quote_currency = instrument.split("_")[1] if "_" in instrument else None
+    if quote_currency == account_currency:
+        rate = Decimal("1")
+    elif quote_to_account_rate is None:
+        raise ValueError(
+            f"position_size for {instrument} on a {account_currency} account "
+            f"requires quote_to_account_rate (rate from {quote_currency} to "
+            f"{account_currency}). Pass an explicit value to avoid silent mis-sizing."
+        )
+    else:
+        rate = Decimal(str(quote_to_account_rate))
+
     risk_amount = Decimal(str(balance)) * Decimal(str(risk_pct)) / Decimal("100")
-    pip_value_per_unit = pip_size(instrument) * Decimal(str(quote_to_account_rate))
+    pip_value_per_unit = pip_size(instrument) * rate
     units = risk_amount / (Decimal(stop_loss_pips) * pip_value_per_unit)
     return int(units)
 

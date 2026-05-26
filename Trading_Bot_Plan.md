@@ -319,3 +319,45 @@ Cross-validated by a multi-agent research review of OANDA's official docs (May 2
 - `orderRejectTransaction` detection in 2xx response bodies (`OandaOrderRejected` exception)
 - Descriptive User-Agent header
 - `(connect, read)` timeout tuples — longer read timeout on POST `/orders` to avoid ambiguous-state retries
+
+---
+
+## Phase 3 Post-Review — Bundle C (deferred)
+
+The Phase 3 risk management code (Slices 1 + 2) was reviewed by 4 specialized analysis agents after implementation. Bundles A and B from that review have been fixed; Bundle C is deferred to later phases or low-priority cleanup.
+
+**Defer to Phase 5 — Strategy Engine (needs market data + strategy context):**
+- **Gate market orders on `tradeable: true`** from the price stream. OANDA's PRICE events carry a `tradeable` flag — market orders during low-liquidity windows (rollover, halts) are rejected with `MARKET_HALTED`. Needs the stream/aggregator to feed market state to the order layer, which only makes sense once strategy code wires it all together. Source: [Pricing Definitions](https://developer.oanda.com/rest-live-v20/pricing-df/).
+- **ATR-based dynamic stop-loss.** Plan placed ATR under Phase 3 per-trade risk, but ATR is fundamentally an indicator (Phase 5 scope). Currently `position_size` accepts a static `stop_loss_pips`. When Phase 5 builds indicators, add an ATR helper and have the strategy compute SL from ATR before calling position_size.
+- **`get_open_trades` / `close_trade(trade_id, units="ALL")` wrappers.** Per-trade lifecycle tracking under netting. Not needed yet because no strategy is doing per-trade management, but Phase 5 trailing-stop logic will need it. Source: [Trade Endpoint](https://developer.oanda.com/rest-live-v20/trade-ep/).
+- **`modify_trade_orders(trade_id, stop_loss=..., take_profit=...)`** wrapping `PUT /trades/{tradeID}/orders` — needed for breakeven and trailing stops. Source: [Order Endpoint](https://developer.oanda.com/rest-live-v20/order-ep/).
+- **`distance` vs `price` form for SL/TP.** Currently `place_market_order` always uses `distance`. London Breakout (Phase 5) will need `price` form for SL placed at the Asian range boundary. Add an alternative `stop_loss_price` parameter when that strategy is built.
+
+**Defer to Phase 4 — Logging & Notifications:**
+- **Graduated warning levels** for daily loss (e.g., 2%/3%/4% thresholds), drawdown (5%/7%/9%), and approaching daily limits. Currently only the 1,500-request warning exists. Phase 4's email alerts would naturally consume these.
+- **Structured logging on every risk check.** Currently the guard prints nothing — limit breaches don't get logged anywhere. Phase 4 should add `logging.getLogger(__name__)` calls on refresh, near-limit warnings, and block events for audit/post-mortem use.
+- **Audit log per authenticated action** — token used, account ID, endpoint, response code, request ID, `lastTransactionID`. Required for FTMO post-incident review.
+
+**Defer to Phase 7 — Production Hardening:**
+- **VPS disconnect kill switch.** Per OANDA's autonomous-trader guidance: if the bot loses connection >30s, auto-flatten all positions. Tiered defense beyond strategy-level stops.
+- **Forex hours awareness.** 17:00 ET Friday close → 17:05 ET Sunday open. Close positions or widen SLs before Friday close to avoid weekend gaps blowing through stops. Source: [OANDA Hours of Operation](https://www.oanda.com/us-en/trading/hours-of-operation/).
+- **Process supervisor + auto-restart** (systemd / NSSM). Combined with the bot's reconcile-on-startup logic — which is now in place — this lets the bot survive crashes cleanly.
+
+**Architectural cleanup (low priority):**
+- **Move pip helpers from `risk.py` to `oanda_api.py`** (or `oanda_instruments.py`). Current dependency direction is upside-down: low-level OANDA client imports from domain `risk.py` for `pip_distance`. Cleaner: instrument precision lives next to OANDA wire-format concerns.
+- **Cache instrument metadata** at startup via `GET /v3/accounts/{id}/instruments`. Replace hardcoded JPY-quote heuristic with OANDA-provided `displayPrecision` and `pipLocation` per instrument. Needed before trading metals or exotics where `_is_jpy_quote` heuristic breaks.
+- **Subscribe to `/transactions/stream`** for real-time fill awareness. Currently entries are tracked via `record_position_entry()` + periodic reconciliation; a transaction stream would update state instantly. Heartbeat carries `lastTransactionID` for backfill. Source: [Transaction Endpoint](https://developer.oanda.com/rest-live-v20/transaction-ep/).
+- **`GET /accounts/{id}/changes?sinceTransactionID=X`** as the primary state-sync endpoint. OANDA's canonical incremental-sync API. Currently we poll `/summary` per refresh; `/changes` returns aggregated deltas in one call. Most efficient once strategy code triggers many refreshes. Source: [Best Practices](https://developer.oanda.com/rest-live-v20/best-practices/).
+- **Schema versioning** for `risk_state.json`. Currently has `schema_version: 1` field stored but no migration path defined. Add explicit upgrade logic when state schema changes.
+
+**Test coverage gaps (low priority):**
+- DST transition tests in Europe/Prague (last Sunday of March and October) — verify daily rollover still fires correctly.
+- Concurrent state file access tests — currently relies on `_atomic_write_json` + `RLock` correctness without end-to-end proof.
+- Stress test: aggregator with hundreds of ticks across all granularities simultaneously to catch performance regressions.
+- Tests for `_atomic_write_json` failure paths (disk full, permission denied, read-only filesystem).
+- High position-entry-count edge cases on the reconciliation pagination boundary (OANDA caps transactions response at ~1,000).
+
+**Phase 3 deferred per-trade items (kept for Phase 5):**
+- Tradeable gating (see Phase 5 deferrals above)
+- ATR-based stops (see Phase 5 deferrals above)
+- Per-trade lifecycle methods (`get_open_trades`, `close_trade`, `modify_trade_orders`)

@@ -170,7 +170,7 @@ class TestOrderPayload:
     def test_market_order_buy(self):
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             method, url = mock_req.call_args[0]
             payload = mock_req.call_args[1]["json"]
             assert method == "POST"
@@ -183,7 +183,7 @@ class TestOrderPayload:
     def test_market_order_sell_negative_units(self):
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", -500)
+            api.place_market_order("EUR_USD", -500, stop_loss_pips=30)
             payload = mock_req.call_args[1]["json"]
             assert payload["order"]["units"] == "-500"
 
@@ -191,9 +191,37 @@ class TestOrderPayload:
         """OANDA requires units as a string, not an integer."""
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             payload = mock_req.call_args[1]["json"]
             assert isinstance(payload["order"]["units"], str)
+
+
+class TestSLRequired:
+    """Phase 3 'no naked positions' rule: SL must be set unless explicitly opted out."""
+
+    def test_missing_sl_raises_by_default(self):
+        api = make_api()
+        with pytest.raises(ValueError, match="stop_loss_pips is required"):
+            api.place_market_order("EUR_USD", 100)
+
+    def test_allow_naked_overrides_sl_requirement(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, allow_naked=True)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert "stopLossOnFill" not in order
+
+    def test_rr_enforced_when_both_sl_and_tp_provided(self):
+        api = make_api()
+        # SL 30, TP 20 → ratio 0.67, below 1.5
+        with pytest.raises(ValueError, match="Risk-reward"):
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30, take_profit_pips=20)
+
+    def test_rr_pass_at_minimum(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})):
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=20, take_profit_pips=30)
+        # No exception
 
 
 # --- SL/TP, price_bound, client_id ---
@@ -211,8 +239,9 @@ class TestOrderEnhancements:
 
     def test_take_profit_attached_as_distance(self):
         api = make_api()
+        # SL required + R:R must pass: SL=30, TP=50 → ratio 1.67 ≥ 1.5
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100, take_profit_pips=50)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30, take_profit_pips=50)
             order = mock_req.call_args[1]["json"]["order"]
             assert order["takeProfitOnFill"]["distance"] == "0.00500"
             assert order["takeProfitOnFill"]["timeInForce"] == "GTC"
@@ -226,10 +255,10 @@ class TestOrderEnhancements:
             assert "takeProfitOnFill" in order
 
     def test_no_sl_tp_omitted_from_payload(self):
-        """If caller doesn't pass SL/TP, those fields must not appear in the payload."""
+        """allow_naked orders omit stopLossOnFill/takeProfitOnFill from payload."""
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, allow_naked=True)
             order = mock_req.call_args[1]["json"]["order"]
             assert "stopLossOnFill" not in order
             assert "takeProfitOnFill" not in order
@@ -244,14 +273,14 @@ class TestOrderEnhancements:
     def test_price_bound_attached_as_string(self):
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100, price_bound="1.10500")
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30, price_bound="1.10500")
             order = mock_req.call_args[1]["json"]["order"]
             assert order["priceBound"] == "1.10500"
 
     def test_price_bound_omitted_when_not_provided(self):
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             order = mock_req.call_args[1]["json"]["order"]
             assert "priceBound" not in order
 
@@ -259,7 +288,7 @@ class TestOrderEnhancements:
         """Every order gets an idempotency ID by default for safe retries."""
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             order = mock_req.call_args[1]["json"]["order"]
             assert "clientExtensions" in order
             assert order["clientExtensions"]["id"].startswith("bot-")
@@ -267,7 +296,7 @@ class TestOrderEnhancements:
     def test_custom_client_id_honored(self):
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100, client_id="my-strategy-A-001")
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30, client_id="my-strategy-A-001")
             order = mock_req.call_args[1]["json"]["order"]
             assert order["clientExtensions"]["id"] == "my-strategy-A-001"
 
@@ -275,10 +304,10 @@ class TestOrderEnhancements:
         api = make_api()
         ids = []
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             ids.append(mock_req.call_args[1]["json"]["order"]["clientExtensions"]["id"])
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             ids.append(mock_req.call_args[1]["json"]["order"]["clientExtensions"]["id"])
         assert ids[0] != ids[1]
 
@@ -299,14 +328,14 @@ class TestOrderRejectionInBody:
         }
         with patch_request(mock_response(reject_body, 201)):
             with pytest.raises(OandaOrderRejected) as exc_info:
-                api.place_market_order("EUR_USD", 100)
+                api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             assert "INSUFFICIENT_MARGIN" in str(exc_info.value)
 
     def test_orderFillTransaction_returns_normally(self):
         api = make_api()
         fill_body = {"orderFillTransaction": {"price": "1.10000"}}
         with patch_request(mock_response(fill_body, 201)):
-            result = api.place_market_order("EUR_USD", 100)
+            result = api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             assert "orderFillTransaction" in result
 
     def test_orderCancelTransaction_returns_normally(self):
@@ -317,7 +346,7 @@ class TestOrderRejectionInBody:
             "orderCancelTransaction": {"reason": "MARKET_HALTED"},
         }
         with patch_request(mock_response(cancel_body, 201)):
-            result = api.place_market_order("EUR_USD", 100)
+            result = api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             assert "orderCancelTransaction" in result
 
 
@@ -390,7 +419,7 @@ class TestTimeouts:
         leaves the order in an ambiguous state."""
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
-            api.place_market_order("EUR_USD", 100)
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             post_timeout = mock_req.call_args[1]["timeout"]
         with patch_request(mock_response({})) as mock_req2:
             api.get_account_summary()
@@ -463,11 +492,11 @@ class TestErrorHandling:
         api = make_api()
         with patch_request(mock_response({"orderRejectTransaction": {}}, 400)):
             with pytest.raises(OandaAPIError):
-                api.place_market_order("EUR_USD", 100)
+                api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
 
     def test_2xx_accepted_not_just_200(self):
         """OANDA returns 201 for POST /orders on success."""
         api = make_api()
         with patch_request(mock_response({"orderFillTransaction": {}}, 201)):
-            result = api.place_market_order("EUR_USD", 100)
+            result = api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
             assert result == {"orderFillTransaction": {}}

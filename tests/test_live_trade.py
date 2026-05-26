@@ -53,8 +53,8 @@ def ensure_closed(api):
 @skip_if_live_env
 class TestLiveTrade:
     def test_place_and_close_market_order(self, api, ensure_closed):
-        # Place buy order
-        order_response = api.place_market_order(INSTRUMENT, UNITS)
+        # Place buy order with a 10-pip SL (Phase 3 "no naked positions" rule)
+        order_response = api.place_market_order(INSTRUMENT, UNITS, stop_loss_pips=10)
         assert "orderFillTransaction" in order_response, (
             f"Order did not fill. Response: {order_response}"
         )
