@@ -2,7 +2,7 @@ import json
 import threading
 from datetime import datetime, timezone
 import config
-from oanda_api import OandaAPI, OandaAPIError
+from oanda_api import OandaAPI, OandaAPIError, OandaOrderRejected
 from oanda_stream import OandaStream
 from candle_aggregator import CandleAggregator
 
@@ -22,6 +22,8 @@ def safe(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
+        except OandaOrderRejected as e:
+            print(f"  Order rejected: {e}")
         except OandaAPIError as e:
             print(f"  API error: {e}")
         except ValueError as e:
@@ -77,9 +79,13 @@ def market_order():
         return
     print(f"  Placing {'BUY' if units > 0 else 'SELL'} order for {abs(units)} units of {INSTRUMENT}...")
     data = api.place_market_order(INSTRUMENT, units)
-    fill = data.get("orderFillTransaction", {})
-    if fill:
+    if "orderFillTransaction" in data:
+        fill = data["orderFillTransaction"]
         print(f"  Filled at: {fill.get('price')}  P/L: {fill.get('pl')}")
+    elif "orderCancelTransaction" in data:
+        # FOK order — couldn't fill at requested price (no liquidity, halted, etc.)
+        cancel = data["orderCancelTransaction"]
+        print(f"  Order cancelled (not filled): {cancel.get('reason')}")
     else:
         print_json(data)
 

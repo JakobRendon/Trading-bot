@@ -264,12 +264,10 @@ Identified during a multi-agent code review (May 2026). These don't block develo
 
 **Code quality / robustness:**
 - **Transaction pagination unhandled** — `get_transactions(since_id="0")` returns the full account history in one shot. OANDA caps responses at ~1000 transactions and uses pagination via the `pages` field for larger histories. Once the practice account has run long enough, history will be silently truncated. Fix: walk pagination until empty.
-- **`mid_price` Decimal precision drift on JPY pairs** — `(bid+ask)/2` for 3dp prices like JPY produces an artificial 4th decimal. Doesn't affect candle math itself, but downstream code comparing aggregator prices to broker prices may never see equality. Fix: quantize result to the instrument's display precision.
+- **`mid_price` Decimal precision drift on JPY pairs** — `(bid+ask)/2` for 3dp prices like JPY produces an artificial 4th decimal. Doesn't affect candle math itself, but downstream code comparing aggregator prices to broker prices may never see equality. Fix: quantize result to the instrument's display precision (solved by instrument metadata cache below).
 - **CandleAggregator skips empty buckets during gaps** — During weekends/halts, intermediate buckets (e.g., M5 candles at 02:05, 02:10, 02:15) are never emitted. Strategies counting "last N candles" will see invisible gaps. Fix: when a tick arrives in a much-later bucket, emit empty/flat candles for all skipped buckets between.
-- **No `requests.Session()` for connection reuse** — Each REST call opens a fresh TCP/TLS connection (~50ms latency). For strategy code firing rapid requests this matters. Fix: share a `Session` across `_get`/`_post`/`_put`.
 - **`parse_tick_time` fragile if OANDA ever sends offset-format timestamps** — Current code uses `rstrip("Z")` then `.replace(tzinfo=UTC)`. If OANDA ever returns `+00:00` style, the replace silently clobbers any non-UTC offset. Theoretical right now. Fix: use `datetime.fromisoformat()` properly without the strip/replace pattern (Python 3.11+ accepts `Z` directly).
 - **`OANDA_ENVIRONMENT` accepts any value as practice** — Case-sensitive, no validation. A typo like `Practice` or `production` silently routes to the practice environment. Fix: validate against `{"practice", "live"}` and raise on unknown.
-- **No User-Agent header on REST calls** — Many brokers prefer one for debugging on their side. Not required, but courteous.
 
 **Test gaps:**
 - **No test for high tick rate / all granularities at once** — All aggregator tests use 1–4 ticks. A stress test with hundreds of ticks across `M1/M5/M15/M30/H1/H4/D` simultaneously would catch precision drift, performance issues, and bucket-tracking bugs.
@@ -285,3 +283,39 @@ Identified during a multi-agent code review (May 2026). These don't block develo
 - Date-range candle fetching (build during Phase 6 backtesting)
 - List tradeable instruments via `/v3/accounts/{id}/instruments` (build during Phase 5 multi-pair work)
 - Modify/cancel pending orders (build when limit orders are added)
+
+---
+
+## OANDA Best Practices — Future Improvements
+
+Cross-validated by a multi-agent research review of OANDA's official docs (May 2026). Bundle A items were addressed in code; Bundles B and C below are deferred to their respective phases.
+
+**Bundle B — Phase 3 (Risk Management):**
+- **`stopLossOnFill` and `takeProfitOnFill` attached at order creation.** Atomic with the entry fill, so there's no window where a position is open without a stop. Critical for FTMO — a network failure between entry and a follow-up SL call could blow the 4% daily-loss buffer. Source: [Order Definitions](https://developer.oanda.com/rest-live-v20/order-df/).
+- **`priceBound` parameter on market orders.** Caps slippage to ~3-5 pips. Without it, a news-event fill could slip 20+ pips and breach FTMO daily loss in one trade. Source: [Order Definitions](https://developer.oanda.com/rest-live-v20/order-df/).
+- **`clientExtensions.id` on every order for idempotency.** After a POST timeout, instead of blindly retrying (which could double-fill), do `GET /orders/@<your_id>` first to see if the order actually landed. Without this we can't safely retry POSTs at all. Source: [Order Endpoint](https://developer.oanda.com/rest-live-v20/order-ep/).
+- **`distance` vs `price` for SL/TP.** Default to `distance` for new ATR/percent-risk strategies — eliminates race conditions where the market moves while the order is in flight. Switch to `price` only when SL is computed from chart structure. Source: [Order Definitions](https://developer.oanda.com/rest-live-v20/order-df/).
+- **Gate market orders on `tradeable: true`** from the price stream. OANDA's PRICE events carry a `tradeable` flag — market orders during low-liquidity windows (rollover, halts) will be rejected with `MARKET_HALTED`. Source: [Pricing Definitions](https://developer.oanda.com/rest-live-v20/pricing-df/).
+- **`get_open_trades()` and `close_trade(trade_id, units="ALL")` wrappers.** Necessary for per-trade lifecycle tracking under netting (we currently only have aggregated position-level operations). Source: [Trade Endpoint](https://developer.oanda.com/rest-live-v20/trade-ep/).
+- **`modify_trade_orders(trade_id, stop_loss=..., take_profit=...)`** wrapping `PUT /trades/{tradeID}/orders` for breakeven / trailing-stop management. Source: [Order Endpoint](https://developer.oanda.com/rest-live-v20/order-ep/).
+
+**Bundle C — Phase 4 (Logging) / Phase 5 (Multi-pair) / Phase 7 (Production Hardening):**
+- **`GET /accounts/{id}/changes?sinceTransactionID=X` for state sync.** OANDA's canonical incremental-sync endpoint, recommended over `/transactions/sinceid` for the main poll loop. Returns aggregated `changes` (orders/trades/positions/transactions deltas), `state` (margin, P/L, NAV), and `lastTransactionID` in one call. Three of four research agents converged on this. Source: [Best Practices](https://developer.oanda.com/rest-live-v20/best-practices/).
+- **Subscribe to `/transactions/stream` for real-time fill awareness.** Production bots run TWO concurrent streams — prices for trade decisions, transactions for fill confirmations and margin-event reactions. Heartbeat carries `lastTransactionID` for backfill. Use a 20s socket timeout for this stream (transactions are lower-frequency than prices). Source: [Transaction Endpoint](https://developer.oanda.com/rest-live-v20/transaction-ep/).
+- **Cache instrument metadata at startup.** Call `GET /v3/accounts/{id}/instruments` once and cache `{instrument: (displayPrecision, pipLocation, minimumTradeSize, tradeUnitsPrecision)}`. Don't hardcode 5dp — JPY pairs use 3dp. Also resolves the `mid_price` Decimal drift issue above. Source: [Primitives](https://developer.oanda.com/rest-live-v20/primitives-df/).
+- **30-second VPS disconnect kill switch.** Per OANDA's official autonomous-trader guidance: if the bot loses connection to OANDA for >30s, flatten all positions automatically. Tiered defense beyond strategy-level stops. Source: [OANDA Autonomous Trader Blog](https://www.oanda.com/us-en/trade-tap-blog/trading-knowledge/the-autonomous-trader-forex-systems/).
+- **Forex hours awareness: 17:00 ET Fri close → 17:05 ET Sun open, plus 6-min daily close at 16:59-17:05 ET.** Bot must close positions or widen SLs before Friday close — OANDA explicitly warns about weekend gaps blowing through stops. Source: [Hours of Operation](https://www.oanda.com/us-en/trading/hours-of-operation/).
+- **Persist `lastTransactionID` to disk for crash recovery.** On restart: load it, call `/changes?sinceTransactionID=<id>`, apply deltas to local state, then reconcile any in-flight orders by looking them up via `clientExtensions.id`. Source: [Best Practices](https://developer.oanda.com/rest-live-v20/best-practices/).
+- **Reconciliation on startup.** Don't trust local state alone — always issue an initial account snapshot request and compare against persisted state, falling back to full rebuild if the gap is too large. Source: [Account Endpoint](https://developer.oanda.com/rest-live-v20/account-ep/).
+- **Audit log every authenticated action.** Token used, account ID, endpoint, response code, request ID, `lastTransactionID`. Required for FTMO post-incident review and dispute resolution. Source: [FTMO Forbidden Practices](https://ftmo.com/en/forbidden-trading-practices/).
+- **Process supervisor (systemd / NSSM) with auto-restart.** OANDA explicitly recommends "VPS is non-negotiable" — colocate close to OANDA's servers, run 24/7, isolate from dev machines. Combine with the bot's reconcile-on-startup logic. Source: [OANDA Autonomous Trader Blog](https://www.oanda.com/us-en/trade-tap-blog/trading-knowledge/the-autonomous-trader-forex-systems/).
+- **Weekend audits.** Per OANDA's official guidance: each weekend, review slippage (intended vs executed entry prices), VPS logs, and "logic drift" comparing current bot behavior to backtest expectations. Increasing slippage signals a market regime change. Source: [OANDA Autonomous Trader Blog](https://www.oanda.com/us-en/trade-tap-blog/trading-knowledge/the-autonomous-trader-forex-systems/).
+- **Token rotation strategy.** OANDA doesn't retain tokens (lost = revoke + regenerate). Keep a "current + next" pattern for zero-downtime rotation. Use separate tokens for practice vs live to prevent cross-environment mistakes. Source: [Authentication](https://developer.oanda.com/rest-live-v20/authentication/).
+- **FTMO 2-min news window applies to SL/TP fills too.** A stop-loss that triggers within ±2 minutes of a restricted news release counts as a breach. Risk engine needs an economic calendar feed AND SLs that won't fire during the window (or position-flatten before the window). Source: [FTMO News Trading FAQ](https://ftmo.com/en/faq/can-i-trade-news/).
+
+**Already addressed (Bundle A):**
+- `requests.Session()` for persistent connections
+- 429 rate-limit retry with `Retry-After` header
+- `orderRejectTransaction` detection in 2xx response bodies (`OandaOrderRejected` exception)
+- Descriptive User-Agent header
+- `(connect, read)` timeout tuples — longer read timeout on POST `/orders` to avoid ambiguous-state retries
