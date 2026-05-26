@@ -1,5 +1,6 @@
 import time
 import requests
+from risk import pip_distance, generate_client_id
 
 
 # Per OANDA best practices, separate connect/read timeouts. The read timeout
@@ -112,8 +113,28 @@ class OandaAPI:
     def get_price(self, instrument):
         return self._get("/pricing", params={"instruments": instrument})
 
-    def place_market_order(self, instrument, units):
+    def place_market_order(
+        self,
+        instrument,
+        units,
+        stop_loss_pips=None,
+        take_profit_pips=None,
+        price_bound=None,
+        client_id=None,
+    ):
         """Place a market order. Positive units = buy, negative = sell.
+
+        Optional risk controls:
+        - stop_loss_pips: distance-form SL attached atomically with the fill.
+          OANDA computes the SL price as `fill ± distance` server-side, so
+          there's no race between the fill arriving and the SL being set.
+        - take_profit_pips: distance-form TP, same atomic guarantee.
+        - price_bound: absolute price string. If the fill would happen at a
+          worse price than this, OANDA rejects with PRICE_BOUNDS_VIOLATION
+          rather than filling at the worse price (slippage cap).
+        - client_id: idempotency key. Auto-generated if not provided. Allows
+          `GET /orders/@client_id` lookup so a network-timed-out POST can be
+          checked rather than blindly retried.
 
         Raises OandaOrderRejected if OANDA returns 2xx with an
         orderRejectTransaction in the body (validation failure).
@@ -121,16 +142,28 @@ class OandaAPI:
         Returns the raw response. Callers should check for `orderFillTransaction`
         (filled) vs `orderCancelTransaction` (FOK couldn't fill at requested price).
         """
-        data = {
-            "order": {
-                "type": "MARKET",
-                "instrument": instrument,
-                "units": str(units),
-                "timeInForce": "FOK",
-                "positionFill": "DEFAULT",
-            }
+        order = {
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "clientExtensions": {"id": client_id or generate_client_id()},
         }
-        response = self._post("/orders", data)
+        if stop_loss_pips is not None:
+            order["stopLossOnFill"] = {
+                "timeInForce": "GTC",
+                "distance": pip_distance(instrument, stop_loss_pips),
+            }
+        if take_profit_pips is not None:
+            order["takeProfitOnFill"] = {
+                "timeInForce": "GTC",
+                "distance": pip_distance(instrument, take_profit_pips),
+            }
+        if price_bound is not None:
+            order["priceBound"] = str(price_bound)
+
+        response = self._post("/orders", {"order": order})
         if "orderRejectTransaction" in response:
             raise OandaOrderRejected(response["orderRejectTransaction"])
         return response

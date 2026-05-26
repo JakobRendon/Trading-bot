@@ -5,6 +5,7 @@ import config
 from oanda_api import OandaAPI, OandaAPIError, OandaOrderRejected
 from oanda_stream import OandaStream
 from candle_aggregator import CandleAggregator
+from risk import position_size, validate_risk_reward
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
@@ -64,26 +65,91 @@ def current_price():
         print(f"  {price['instrument']}  Bid: {price['bids'][0]['price']}  Ask: {price['asks'][0]['price']}")
 
 
+def _prompt_int(prompt, default=None, min_value=None):
+    raw = input(prompt).strip()
+    if not raw and default is not None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if min_value is not None and value < min_value:
+        return None
+    return value
+
+
+def _prompt_float(prompt, default=None, min_value=None):
+    raw = input(prompt).strip()
+    if not raw and default is not None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if min_value is not None and value < min_value:
+        return None
+    return value
+
+
 @safe
 def market_order():
     direction = input("  Buy or Sell? (buy/sell): ").strip().lower()
-    units = input("  Units (e.g. 100): ").strip()
-    if not units.isdigit() or int(units) == 0:
-        print("  Invalid units (must be a positive integer).")
-        return
-    units = int(units)
-    if direction == "sell":
-        units = -units
-    elif direction != "buy":
+    if direction not in ("buy", "sell"):
         print("  Invalid direction.")
         return
-    print(f"  Placing {'BUY' if units > 0 else 'SELL'} order for {abs(units)} units of {INSTRUMENT}...")
-    data = api.place_market_order(INSTRUMENT, units)
+
+    use_sizing = input("  Auto-size from risk %? (y/n) [y]: ").strip().lower() or "y"
+    if use_sizing == "y":
+        balance = _prompt_float("  Account balance (e.g. 25000): ", min_value=1)
+        if balance is None:
+            print("  Invalid balance.")
+            return
+        risk_pct = _prompt_float("  Risk % per trade [1.0]: ", default=1.0, min_value=0.01)
+        if risk_pct is None:
+            print("  Invalid risk %.")
+            return
+        sl_pips = _prompt_int("  Stop-loss in pips [30]: ", default=30, min_value=1)
+        if sl_pips is None:
+            print("  Invalid SL pips.")
+            return
+        units = position_size(balance, risk_pct, sl_pips, INSTRUMENT)
+        if units == 0:
+            print("  Computed position size is 0 — increase risk % or reduce SL.")
+            return
+        print(f"  Computed size: {units} units")
+    else:
+        units = _prompt_int("  Units (e.g. 100): ", min_value=1)
+        if units is None:
+            print("  Invalid units.")
+            return
+        sl_pips = _prompt_int("  Stop-loss in pips (blank for none): ", default=0)
+        sl_pips = sl_pips if sl_pips and sl_pips > 0 else None
+
+    tp_pips = _prompt_int("  Take-profit in pips (blank for none): ", default=0)
+    tp_pips = tp_pips if tp_pips and tp_pips > 0 else None
+
+    # Enforce 1:1.5 minimum reward-to-risk if both SL and TP are set
+    if sl_pips and tp_pips:
+        try:
+            validate_risk_reward(sl_pips, tp_pips)
+        except ValueError as e:
+            print(f"  {e}")
+            return
+
+    if direction == "sell":
+        units = -units
+
+    print(
+        f"  Placing {'BUY' if units > 0 else 'SELL'} order for {abs(units)} units of {INSTRUMENT} "
+        f"(SL: {sl_pips or '-'} pips, TP: {tp_pips or '-'} pips)..."
+    )
+    data = api.place_market_order(
+        INSTRUMENT, units, stop_loss_pips=sl_pips, take_profit_pips=tp_pips
+    )
     if "orderFillTransaction" in data:
         fill = data["orderFillTransaction"]
         print(f"  Filled at: {fill.get('price')}  P/L: {fill.get('pl')}")
     elif "orderCancelTransaction" in data:
-        # FOK order — couldn't fill at requested price (no liquidity, halted, etc.)
         cancel = data["orderCancelTransaction"]
         print(f"  Order cancelled (not filled): {cancel.get('reason')}")
     else:

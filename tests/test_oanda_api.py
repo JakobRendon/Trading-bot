@@ -196,6 +196,93 @@ class TestOrderPayload:
             assert isinstance(payload["order"]["units"], str)
 
 
+# --- SL/TP, price_bound, client_id ---
+
+class TestOrderEnhancements:
+    def test_stop_loss_attached_as_distance(self):
+        """SL is attached via stopLossOnFill.distance — server computes the
+        actual SL price as fill ± distance, eliminating fill/SL race."""
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert order["stopLossOnFill"]["distance"] == "0.00300"
+            assert order["stopLossOnFill"]["timeInForce"] == "GTC"
+
+    def test_take_profit_attached_as_distance(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, take_profit_pips=50)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert order["takeProfitOnFill"]["distance"] == "0.00500"
+            assert order["takeProfitOnFill"]["timeInForce"] == "GTC"
+
+    def test_sl_and_tp_together(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, stop_loss_pips=30, take_profit_pips=60)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert "stopLossOnFill" in order
+            assert "takeProfitOnFill" in order
+
+    def test_no_sl_tp_omitted_from_payload(self):
+        """If caller doesn't pass SL/TP, those fields must not appear in the payload."""
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert "stopLossOnFill" not in order
+            assert "takeProfitOnFill" not in order
+
+    def test_jpy_pair_uses_3dp_for_sl_distance(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("USD_JPY", 100, stop_loss_pips=30)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert order["stopLossOnFill"]["distance"] == "0.300"
+
+    def test_price_bound_attached_as_string(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, price_bound="1.10500")
+            order = mock_req.call_args[1]["json"]["order"]
+            assert order["priceBound"] == "1.10500"
+
+    def test_price_bound_omitted_when_not_provided(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert "priceBound" not in order
+
+    def test_client_id_generated_when_not_provided(self):
+        """Every order gets an idempotency ID by default for safe retries."""
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100)
+            order = mock_req.call_args[1]["json"]["order"]
+            assert "clientExtensions" in order
+            assert order["clientExtensions"]["id"].startswith("bot-")
+
+    def test_custom_client_id_honored(self):
+        api = make_api()
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100, client_id="my-strategy-A-001")
+            order = mock_req.call_args[1]["json"]["order"]
+            assert order["clientExtensions"]["id"] == "my-strategy-A-001"
+
+    def test_each_order_gets_unique_auto_id(self):
+        api = make_api()
+        ids = []
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100)
+            ids.append(mock_req.call_args[1]["json"]["order"]["clientExtensions"]["id"])
+        with patch_request(mock_response({"orderFillTransaction": {}})) as mock_req:
+            api.place_market_order("EUR_USD", 100)
+            ids.append(mock_req.call_args[1]["json"]["order"]["clientExtensions"]["id"])
+        assert ids[0] != ids[1]
+
+
 # --- Order rejection in 2xx body ---
 
 class TestOrderRejectionInBody:
