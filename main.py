@@ -1,6 +1,7 @@
 import json
 import threading
 from datetime import datetime, timezone
+from decimal import Decimal
 import config
 from oanda_api import OandaAPI, OandaAPIError, OandaOrderRejected
 from oanda_stream import OandaStream
@@ -10,6 +11,7 @@ from risk_guard import FTMORiskGuard
 from strategy import FixedSignalStrategy
 from strategy_runner import StrategyRunner
 from london_breakout import LondonBreakoutStrategy
+from backtest import Backtester, normalize_oanda_candle
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
@@ -330,6 +332,42 @@ def run_strategy():
 
 
 @safe
+def backtest_london_breakout():
+    """Run a historical backtest of LondonBreakoutStrategy on OANDA M15 data."""
+    days_input = input("  How many days of history? [60]: ").strip() or "60"
+    try:
+        days = int(days_input)
+    except ValueError:
+        print("  Invalid days.")
+        return
+    starting_balance_input = input("  Starting balance [25000]: ").strip() or "25000"
+    try:
+        starting_balance = Decimal(starting_balance_input)
+    except (ValueError, ArithmeticError):
+        print("  Invalid balance.")
+        return
+
+    from datetime import datetime, timedelta, timezone
+    to_dt = datetime.now(timezone.utc)
+    from_dt = to_dt - timedelta(days=days)
+    from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(f"  Fetching {INSTRUMENT} M15 candles from {from_iso} to {to_iso}...")
+    oanda_candles = api.get_candles_range(INSTRUMENT, "M15", from_iso, to_iso)
+    print(f"  Got {len(oanda_candles)} candles.")
+    if not oanda_candles:
+        print("  No candles returned.")
+        return
+
+    candles = [normalize_oanda_candle(c, INSTRUMENT, "M15") for c in oanda_candles]
+    strategy = LondonBreakoutStrategy(instrument=INSTRUMENT)
+    result = Backtester(strategy, starting_balance=starting_balance).run(candles)
+    print()
+    print(result.summary())
+
+
+@safe
 def risk_status():
     s = guard.summary()
     allowed, reason = guard.can_open_position()
@@ -383,7 +421,8 @@ MENU = """
 9. Stream + aggregate candles
 10. Risk status
 11. Run strategy (paper mode)
-12. Exit
+12. Backtest London Breakout
+13. Exit
 """
 
 ACTIONS = {
@@ -398,6 +437,7 @@ ACTIONS = {
     "9": stream_candles,
     "10": risk_status,
     "11": run_strategy,
+    "12": backtest_london_breakout,
 }
 
 
@@ -413,7 +453,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "12":
+        if choice == "13":
             break
         action = ACTIONS.get(choice)
         if action:

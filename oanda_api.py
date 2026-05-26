@@ -122,6 +122,51 @@ class OandaAPI:
             use_base=True,
         )
 
+    def get_candles_range(self, instrument, granularity, from_time, to_time, price="M"):
+        """Fetch all candles in [from_time, to_time] via pagination.
+
+        from_time, to_time: RFC3339 strings (e.g., "2024-01-01T00:00:00Z").
+        Returns a single list of OANDA candle dicts, concatenated across pages
+        and filtered to candles with time <= to_time.
+
+        OANDA rejects `count` together with `to`, so we page using `from + count`
+        and stop client-side when we cross to_time.
+        """
+        PAGE_SIZE = 5000
+        all_candles = []
+        current_from = from_time
+        include_first = True
+
+        while True:
+            params = {
+                "granularity": granularity,
+                "from": current_from,
+                "count": PAGE_SIZE,
+                "price": price,
+                "includeFirst": "true" if include_first else "false",
+            }
+            data = self._get(
+                f"/instruments/{instrument}/candles",
+                params=params,
+                use_base=True,
+            )
+            candles = data.get("candles", [])
+            if not candles:
+                break
+
+            # Drop candles past the requested end time and stop if we crossed it.
+            in_range = [c for c in candles if c["time"] <= to_time]
+            all_candles.extend(in_range)
+            if len(in_range) < len(candles):
+                break  # Reached to_time
+            if len(candles) < PAGE_SIZE:
+                break  # No more data available
+
+            current_from = candles[-1]["time"]
+            include_first = False
+
+        return all_candles
+
     def get_price(self, instrument):
         return self._get("/pricing", params={"instruments": instrument})
 
