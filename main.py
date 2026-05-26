@@ -7,6 +7,8 @@ from oanda_stream import OandaStream
 from candle_aggregator import CandleAggregator
 from risk import position_size, validate_risk_reward
 from risk_guard import FTMORiskGuard
+from strategy import FixedSignalStrategy
+from strategy_runner import StrategyRunner
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
@@ -271,6 +273,51 @@ def stream_candles():
 
 
 @safe
+def run_strategy():
+    """Run a strategy in paper mode against the live stream.
+
+    Currently uses FixedSignalStrategy (emits a long signal on every M1 candle
+    close) for wiring verification. Phase 5 follow-up slices will add real
+    strategies (London Breakout, Mean Reversion).
+    """
+    duration_input = input("  Run for how many seconds? [120]: ").strip() or "120"
+    try:
+        duration = int(duration_input)
+    except ValueError:
+        print("  Invalid duration.")
+        return
+
+    print("  Running FixedSignalStrategy in PAPER mode (no real orders).")
+    strategy = FixedSignalStrategy(instrument=INSTRUMENT, granularity="M1")
+    runner = StrategyRunner(api, guard, strategy, paper=True)
+
+    stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+    aggregator = CandleAggregator(["M1"])
+    aggregator.on_candle_close(runner.on_candle_close)
+    stream.on_price(aggregator.on_tick)
+
+    print(f"  Streaming {INSTRUMENT} for {duration}s (Ctrl+C to stop)...")
+    timer = threading.Timer(duration, stream.stop)
+    timer.start()
+    try:
+        stream.start([INSTRUMENT], max_reconnects=5)
+    except KeyboardInterrupt:
+        stream.stop()
+    finally:
+        timer.cancel()
+
+    print(f"  Recorded {len(runner.activity)} strategy events:")
+    for event in runner.activity:
+        if event["type"] == "paper":
+            sig = event["signal"]
+            print(f"    PAPER {sig.direction} SL:{sig.stop_loss_pips} TP:{sig.take_profit_pips}")
+        elif event["type"] == "blocked":
+            print(f"    BLOCKED ({event['reason']})")
+        else:
+            print(f"    {event['type'].upper()}")
+
+
+@safe
 def risk_status():
     s = guard.summary()
     allowed, reason = guard.can_open_position()
@@ -323,7 +370,8 @@ MENU = """
 8. Stream live prices
 9. Stream + aggregate candles
 10. Risk status
-11. Exit
+11. Run strategy (paper mode)
+12. Exit
 """
 
 ACTIONS = {
@@ -337,6 +385,7 @@ ACTIONS = {
     "8": stream_prices,
     "9": stream_candles,
     "10": risk_status,
+    "11": run_strategy,
 }
 
 
@@ -352,7 +401,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "11":
+        if choice == "12":
             break
         action = ACTIONS.get(choice)
         if action:

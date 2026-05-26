@@ -12,6 +12,9 @@ import config
 from oanda_api import OandaAPI
 from oanda_stream import OandaStream
 from candle_aggregator import CandleAggregator
+from risk_guard import FTMORiskGuard
+from strategy import FixedSignalStrategy
+from strategy_runner import StrategyRunner
 
 needs_credentials = pytest.mark.skipif(
     not config.API_TOKEN or not config.ACCOUNT_ID,
@@ -176,6 +179,42 @@ class TestCandleAggregation:
         assert candle["high"] >= candle["close"]
         assert candle["low"] <= candle["open"]
         assert candle["low"] <= candle["close"]
+
+
+@needs_credentials
+@needs_market_open
+class TestStrategyRunnerPaperMode:
+    def test_runner_routes_signal_to_paper_log(self, api, tmp_path):
+        """Full Phase 5 wiring against live OANDA: stream → aggregator → runner →
+        strategy → guard → paper log. Verifies signals flow end-to-end without
+        placing orders."""
+        guard = FTMORiskGuard(api, state_path=str(tmp_path / "risk_state.json"))
+        strategy = FixedSignalStrategy(instrument="EUR_USD", granularity="M1")
+        runner = StrategyRunner(api, guard, strategy, paper=True)
+
+        stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
+        aggregator = CandleAggregator(["M1"])
+        aggregator.on_candle_close(runner.on_candle_close)
+        stream.on_price(aggregator.on_tick)
+
+        def stop_after_first(*_):
+            if runner.activity:
+                stream.stop()
+        # Polling the activity inside the candle close is messy; use a timer.
+        timer = threading.Timer(90.0, stream.stop)
+        timer.start()
+        try:
+            stream.start(["EUR_USD"], max_reconnects=2)
+        finally:
+            timer.cancel()
+
+        assert len(runner.activity) >= 1, "No signal recorded within 90s"
+        event = runner.activity[0]
+        # Paper mode: no real order placed
+        assert event["type"] in ("paper", "blocked")
+        if event["type"] == "paper":
+            assert event["signal"].direction == "long"
+            assert event["signal"].stop_loss_pips == 20
 
 
 @needs_credentials

@@ -62,6 +62,19 @@ Two layers: per-trade controls and FTMO account-level limits.
 
 ---
 
+## Phase ordering note (decided 2026-05-26)
+
+Building Phase 5 (Strategy Engine) **before** Phase 4 (Logging & Notifications).
+
+Rationale:
+- Strategies define what's worth logging. Building Phase 4 first risks logging the wrong events or missing the right ones.
+- Phase 4's email alerts are most valuable for *unattended* trading — and the bot isn't unattended until strategies run autonomously.
+- Logging is horizontal infrastructure; the call sites it needs to wrap are in the strategy layer that doesn't exist yet.
+
+Compromise: add minimal stdlib `logging.getLogger(__name__)` calls during Phase 5 development for debugging. Phase 4 then builds the full audit-trail story (file rotation, email alerts, structured format, daily summaries) on top of strategies' actual event surface.
+
+---
+
 ## Phase 4: Logging & Notifications
 
 **File logging:**
