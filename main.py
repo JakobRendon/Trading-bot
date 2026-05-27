@@ -11,7 +11,7 @@ from risk_guard import FTMORiskGuard
 from strategy import FixedSignalStrategy
 from strategy_runner import StrategyRunner
 from london_breakout import LondonBreakoutStrategy
-from backtest import Backtester, normalize_oanda_candle
+from backtest import Backtester, WalkForwardAnalyzer, normalize_oanda_candle
 
 # Use the first configured instrument for single-instrument menu actions.
 # Streaming menu actions use the full config.INSTRUMENTS list.
@@ -368,6 +368,62 @@ def backtest_london_breakout():
 
 
 @safe
+def walk_forward_london_breakout():
+    """Walk-forward analysis of LondonBreakoutStrategy across rolling test windows.
+
+    Surfaces strategy regime-sensitivity: a strategy that wins on some windows
+    but loses on others isn't robust, even if its overall P/L looks acceptable.
+    """
+    days_input = input("  Total history (days)? [180]: ").strip() or "180"
+    window_days_input = input("  Test window size (days)? [30]: ").strip() or "30"
+    try:
+        days = int(days_input)
+        window_days = int(window_days_input)
+    except ValueError:
+        print("  Invalid input.")
+        return
+
+    from datetime import datetime, timedelta, timezone
+    to_dt = datetime.now(timezone.utc)
+    from_dt = to_dt - timedelta(days=days)
+    from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(f"  Fetching {INSTRUMENT} M15 candles ({days} days)...")
+    oanda_candles = api.get_candles_range(INSTRUMENT, "M15", from_iso, to_iso)
+    print(f"  Got {len(oanda_candles)} candles.")
+    if not oanda_candles:
+        return
+
+    candles = [normalize_oanda_candle(c, INSTRUMENT, "M15") for c in oanda_candles]
+
+    # M15: 96 candles/day. Window size in candles:
+    window_candles = window_days * 96
+
+    analyzer = WalkForwardAnalyzer(
+        strategy_factory=lambda: LondonBreakoutStrategy(instrument=INSTRUMENT),
+        starting_balance=Decimal("25000"),
+        risk_pct=1.0,
+    )
+    result = analyzer.run(candles, window_size=window_candles, warmup=96)
+
+    print()
+    print(result.summary())
+    print()
+    print("Per-window detail:")
+    from datetime import datetime as _dt, timezone as _tz
+    for i, w in enumerate(result.windows, 1):
+        start = _dt.fromtimestamp(w.start_time, tz=_tz.utc).date()
+        end = _dt.fromtimestamp(w.end_time, tz=_tz.utc).date()
+        r = w.result
+        pf = f"{r.profit_factor:.2f}" if r.profit_factor else "N/A"
+        print(
+            f"  Window {i} ({start}..{end}): trades={r.num_trades:>2} "
+            f"win={r.win_rate * 100:>4.0f}% PF={pf:>5} P/L={r.total_pl:>8.0f}"
+        )
+
+
+@safe
 def risk_status():
     s = guard.summary()
     allowed, reason = guard.can_open_position()
@@ -422,7 +478,8 @@ MENU = """
 10. Risk status
 11. Run strategy (paper mode)
 12. Backtest London Breakout
-13. Exit
+13. Walk-forward London Breakout
+14. Exit
 """
 
 ACTIONS = {
@@ -438,6 +495,7 @@ ACTIONS = {
     "10": risk_status,
     "11": run_strategy,
     "12": backtest_london_breakout,
+    "13": walk_forward_london_breakout,
 }
 
 
@@ -453,7 +511,7 @@ def main():
     while True:
         print(MENU)
         choice = input("Choose an option: ").strip()
-        if choice == "13":
+        if choice == "14":
             break
         action = ACTIONS.get(choice)
         if action:

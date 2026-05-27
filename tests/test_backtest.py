@@ -15,6 +15,7 @@ import pytest
 from strategy import Strategy, Signal
 from backtest import (
     Backtester, BacktestResult, SimulatedTrade, normalize_oanda_candle,
+    WalkForwardAnalyzer, WalkForwardResult, WindowResult,
 )
 
 
@@ -301,3 +302,193 @@ class TestNormalizeOandaCandle:
         }
         result = normalize_oanda_candle(oanda, "EUR_USD", "M1")
         assert result["start_time"] > 0
+
+
+# --- Walk-forward analysis ---
+
+class CountingStrategy(Strategy):
+    """Emits a long signal every Nth candle. Stateful so each WF window
+    needs a fresh instance (proves the factory pattern works)."""
+
+    def __init__(self, every_n=10, instrument="EUR_USD"):
+        self._instrument = instrument
+        self.every_n = every_n
+        self._counter = 0
+
+    @property
+    def instrument(self):
+        return self._instrument
+
+    @property
+    def granularity(self):
+        return "M1"
+
+    @property
+    def history_size(self):
+        return 20
+
+    def on_candle_close(self, candle, history):
+        self._counter += 1
+        if self._counter % self.every_n != 0:
+            return None
+        return Signal(
+            direction="long", stop_loss_pips=20, take_profit_pips=40,
+            units=100, reason="counting",
+        )
+
+
+def build_candles(n, start_time=0, granularity_seconds=60, price=1.10000):
+    """Build a sequence of flat M1 candles (no trades will trigger SL/TP)."""
+    return [
+        {
+            "instrument": "EUR_USD",
+            "granularity": "M1",
+            "start_time": start_time + i * granularity_seconds,
+            "open": Decimal(str(price)),
+            "high": Decimal(str(price)),
+            "low": Decimal(str(price)),
+            "close": Decimal(str(price)),
+            "volume": 1,
+        }
+        for i in range(n)
+    ]
+
+
+class TestWalkForwardBasics:
+    def test_empty_candles_returns_no_windows(self):
+        analyzer = WalkForwardAnalyzer(lambda: CountingStrategy())
+        result = analyzer.run([], window_size=100)
+        assert result.windows == []
+
+    def test_insufficient_data_returns_no_windows(self):
+        """Need at least warmup + window_size candles."""
+        analyzer = WalkForwardAnalyzer(lambda: CountingStrategy())
+        candles = build_candles(50)  # less than default warmup (64) + window
+        result = analyzer.run(candles, window_size=100, warmup=64)
+        assert result.windows == []
+
+    def test_exactly_one_window_when_data_fits_once(self):
+        analyzer = WalkForwardAnalyzer(lambda: CountingStrategy())
+        # warmup=10 + window=20 = 30 candles minimum
+        candles = build_candles(30)
+        result = analyzer.run(candles, window_size=20, warmup=10)
+        assert len(result.windows) == 1
+
+    def test_multiple_non_overlapping_windows(self):
+        analyzer = WalkForwardAnalyzer(lambda: CountingStrategy())
+        # warmup=10 + 3 windows of 20 = 70 candles
+        candles = build_candles(70)
+        result = analyzer.run(candles, window_size=20, warmup=10)
+        # Window 1: idx 10..29, Window 2: 30..49, Window 3: 50..69
+        assert len(result.windows) == 3
+
+    def test_factory_creates_fresh_instance_per_window(self):
+        # Use a list to count factory invocations
+        instances = []
+
+        def factory():
+            s = CountingStrategy(every_n=5)
+            instances.append(s)
+            return s
+
+        analyzer = WalkForwardAnalyzer(factory)
+        candles = build_candles(70)
+        analyzer.run(candles, window_size=20, warmup=10)
+        # 3 windows × 1 factory call per window = 3 instances
+        assert len(instances) == 3
+
+    def test_overlapping_windows_via_step(self):
+        analyzer = WalkForwardAnalyzer(lambda: CountingStrategy())
+        candles = build_candles(100)
+        # 50% overlap: window=20, step=10
+        result = analyzer.run(candles, window_size=20, step=10, warmup=10)
+        # Windows start at indices 10, 20, 30, ... 80; each ends 20 later.
+        # Last valid start: 80 (80+20=100 <= 100). Steps: 10,20,30,40,50,60,70,80 = 8 windows
+        assert len(result.windows) == 8
+
+
+class TestWalkForwardMetrics:
+    def _make_result_with_pl_per_window(self, window_pls):
+        """Build a WalkForwardResult with fixed P/L per window."""
+        windows = []
+        for i, pl in enumerate(window_pls):
+            # Build a trade with the right P/L sign
+            trade = SimulatedTrade(
+                direction="long", units=100, entry_time=i * 1000,
+                entry_price=Decimal("1.10000"),
+                sl_price=Decimal("1.09000"), tp_price=Decimal("1.11000"),
+                exit_time=i * 1000 + 500, exit_price=Decimal("1.10100"),
+                exit_reason="tp" if pl > 0 else "sl", pl=Decimal(str(pl)),
+            )
+            window_result = BacktestResult(
+                trades=[trade],
+                starting_balance=Decimal("10000"),
+                final_balance=Decimal("10000") + Decimal(str(pl)),
+                equity_curve=[],
+            )
+            windows.append(WindowResult(
+                start_time=i * 1000,
+                end_time=i * 1000 + 1000,
+                result=window_result,
+            ))
+        return WalkForwardResult(windows=windows)
+
+    def test_total_pl_sums_across_windows(self):
+        result = self._make_result_with_pl_per_window([100, -50, 200])
+        assert result.total_pl == Decimal(250)
+
+    def test_aggregate_win_rate(self):
+        result = self._make_result_with_pl_per_window([100, -50, 200, -25, 300])
+        # 3 wins, 2 losses
+        assert result.aggregate_win_rate == Decimal(3) / Decimal(5)
+
+    def test_aggregate_profit_factor(self):
+        result = self._make_result_with_pl_per_window([100, -50, 200, -25, 300])
+        # gross profit = 600, gross loss = 75
+        assert result.aggregate_profit_factor == Decimal(600) / Decimal(75)
+
+    def test_profitable_windows_pct(self):
+        # 3 of 5 windows profitable = 60%
+        result = self._make_result_with_pl_per_window([100, -50, 200, -25, 300])
+        assert result.profitable_windows_pct == Decimal(60)
+
+    def test_best_and_worst_window(self):
+        result = self._make_result_with_pl_per_window([100, -50, 200, -25, 300])
+        assert result.best_window_pl == Decimal(300)
+        assert result.worst_window_pl == Decimal(-50)
+
+    def test_no_losses_returns_none_profit_factor(self):
+        result = self._make_result_with_pl_per_window([100, 200, 300])
+        assert result.aggregate_profit_factor is None
+
+
+class TestWalkForwardWarmupFiltering:
+    def test_warmup_trades_excluded_from_window(self):
+        """Trades opened before window_start are filtered out."""
+        # Build candles where strategy fires on every candle. With warmup=10,
+        # the first window starts at index 10. Trades from candles 0..9 should
+        # not count toward window 1's metrics.
+
+        class OnLong(Strategy):
+            @property
+            def instrument(self):
+                return "EUR_USD"
+            @property
+            def granularity(self):
+                return "M1"
+            @property
+            def history_size(self):
+                return 5
+            def on_candle_close(self, candle, history):
+                return Signal(
+                    direction="long", stop_loss_pips=100, take_profit_pips=200,
+                    units=100, reason="alwayslong",
+                )
+
+        candles = build_candles(30)
+        analyzer = WalkForwardAnalyzer(lambda: OnLong())
+        result = analyzer.run(candles, window_size=20, warmup=10)
+        # One window — trades opened at candles 10..29 only (not 0..9 warmup)
+        window = result.windows[0]
+        for trade in window.result.trades:
+            assert trade.entry_time >= candles[10]["start_time"]

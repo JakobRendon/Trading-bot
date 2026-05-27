@@ -25,7 +25,7 @@ Current limitations:
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from risk import pip_size, position_size
 
@@ -319,3 +319,185 @@ class Backtester:
         if not trade.is_long:
             diff = -diff
         return diff * Decimal(trade.units)
+
+
+# --- Walk-forward analysis ---
+
+@dataclass
+class WindowResult:
+    """One test window's contribution to a walk-forward run."""
+    start_time: float
+    end_time: float
+    result: BacktestResult
+
+
+@dataclass
+class WalkForwardResult:
+    """Aggregate of per-window backtest results.
+
+    Walk-forward is the plan's required validation pattern: split history
+    into multiple test windows, run the strategy on each independently, and
+    look for consistency. A strategy that wins on one window but loses on
+    another isn't robust — fixed-parameter walk-forward surfaces this even
+    without parameter optimization.
+    """
+    windows: List[WindowResult]
+
+    @property
+    def total_trades(self) -> int:
+        return sum(w.result.num_trades for w in self.windows)
+
+    @property
+    def total_pl(self) -> Decimal:
+        return sum((w.result.total_pl for w in self.windows), Decimal(0))
+
+    @property
+    def aggregate_win_rate(self) -> Decimal:
+        wins = sum(w.result.num_wins for w in self.windows)
+        total = self.total_trades
+        if total == 0:
+            return Decimal(0)
+        return Decimal(wins) / Decimal(total)
+
+    @property
+    def aggregate_profit_factor(self) -> Optional[Decimal]:
+        gross_profit = Decimal(0)
+        gross_loss = Decimal(0)
+        for w in self.windows:
+            for t in w.result.closed_trades:
+                if t.pl is None:
+                    continue
+                if t.pl > 0:
+                    gross_profit += t.pl
+                elif t.pl < 0:
+                    gross_loss += abs(t.pl)
+        if gross_loss == 0:
+            return None
+        return gross_profit / gross_loss
+
+    @property
+    def profitable_windows_pct(self) -> Decimal:
+        if not self.windows:
+            return Decimal(0)
+        winners = sum(1 for w in self.windows if w.result.total_pl > 0)
+        return Decimal(winners) / Decimal(len(self.windows)) * Decimal(100)
+
+    @property
+    def worst_window_pl(self) -> Decimal:
+        if not self.windows:
+            return Decimal(0)
+        return min(w.result.total_pl for w in self.windows)
+
+    @property
+    def best_window_pl(self) -> Decimal:
+        if not self.windows:
+            return Decimal(0)
+        return max(w.result.total_pl for w in self.windows)
+
+    def summary(self) -> str:
+        pf = self.aggregate_profit_factor
+        pf_str = f"{pf:.2f}" if pf is not None else "N/A"
+        lines = [
+            f"Windows: {len(self.windows)}",
+            f"Profitable windows: {self.profitable_windows_pct:.0f}%",
+            f"Total trades: {self.total_trades}",
+            f"Aggregate win rate: {self.aggregate_win_rate * 100:.1f}%",
+            f"Aggregate profit factor: {pf_str}",
+            f"Total P/L (sum of windows): {self.total_pl:.2f}",
+            f"Best window: {self.best_window_pl:.2f}",
+            f"Worst window: {self.worst_window_pl:.2f}",
+        ]
+        return "\n".join(lines)
+
+
+class WalkForwardAnalyzer:
+    """Run a strategy across rolling test windows.
+
+    For each window, builds a fresh strategy via `strategy_factory()` and
+    runs an isolated backtest. Trades opened during the window's warmup
+    period are filtered out so they don't contaminate the window's metrics.
+
+    This is the simple (no-optimization) form of walk-forward. The full
+    Phase 6 form adds a `train` period where parameters are optimized
+    against a separate `test` period.
+    """
+
+    def __init__(
+        self,
+        strategy_factory: Callable,
+        starting_balance=Decimal("25000"),
+        risk_pct=1.0,
+        account_currency="USD",
+    ):
+        self.strategy_factory = strategy_factory
+        self.starting_balance = Decimal(str(starting_balance))
+        self.risk_pct = risk_pct
+        self.account_currency = account_currency
+
+    def run(
+        self,
+        candles,
+        window_size: int,
+        step: Optional[int] = None,
+        warmup: int = 64,
+    ) -> WalkForwardResult:
+        """Run walk-forward on the given candles.
+
+        window_size: candles per test window
+        step: candles between window starts (defaults to window_size = non-overlapping)
+        warmup: prior candles given to each window's strategy for context
+
+        Trades that open during the warmup portion of a chunk are filtered
+        out of the window's result so they don't double-count.
+        """
+        if step is None:
+            step = window_size
+        if not candles or len(candles) < warmup + window_size:
+            return WalkForwardResult(windows=[])
+
+        windows: List[WindowResult] = []
+        start_idx = warmup
+
+        while start_idx + window_size <= len(candles):
+            end_idx = start_idx + window_size
+            chunk_start = max(0, start_idx - warmup)
+            chunk = candles[chunk_start:end_idx]
+
+            strategy = self.strategy_factory()
+            backtester = Backtester(
+                strategy=strategy,
+                starting_balance=self.starting_balance,
+                risk_pct=self.risk_pct,
+                account_currency=self.account_currency,
+            )
+            raw_result = backtester.run(chunk)
+
+            window_start_time = candles[start_idx]["start_time"]
+            window_end_time = candles[end_idx - 1]["start_time"]
+
+            # Filter to trades that opened within the test window (skip warmup).
+            window_trades = [
+                t for t in raw_result.trades
+                if window_start_time <= t.entry_time <= window_end_time
+            ]
+            window_pl = sum(
+                (t.pl for t in window_trades if t.pl is not None),
+                Decimal(0),
+            )
+            window_result = BacktestResult(
+                trades=window_trades,
+                starting_balance=self.starting_balance,
+                final_balance=self.starting_balance + window_pl,
+                # Equity curve isn't meaningful after filtering — leave empty.
+                equity_curve=[],
+            )
+
+            windows.append(WindowResult(
+                start_time=window_start_time,
+                end_time=window_end_time,
+                result=window_result,
+            ))
+
+            start_idx += step
+
+        return WalkForwardResult(windows=windows)
