@@ -4,6 +4,74 @@ Target: FTMO prop trading via OANDA v20 API. Starting with $25k challenge, scali
 
 ---
 
+## 2026-05-27 Review Outcome
+
+A multi-agent pre-Phase-4 review surfaced 7 critical bugs, FTMO compliance gaps, and backtest realism issues. Resolved in a single bundle pass on 2026-05-27.
+
+**Landed:**
+- All Bundle A bugs (KeyError crash, cross-currency position sizing, eager `_last_trade_date`, stream/aggregator exception isolation, position-stacking guard, backtester explicit-units validation)
+- B1: `CHALLENGE_TYPE` config drives daily-loss buffer (2-step: 4%, 1-step: 2%)
+- B3: Daily anchor reverted to **balance** (FTMO MDL rule) — was incorrectly anchored on NAV
+- B6: Backtester now flags FTMO daily-loss / total-drawdown breaches per challenge type
+- C1+C2: Backtester models `spread_pips` (bid/ask shift) and SL gap-through fills
+- D4: Backtester calls `strategy.on_candle_close()` every candle (parity with live runner post-A5)
+- D5: Walk-forward windows now emit a filtered equity curve so max-drawdown reflects the window
+
+**Headline finding:** Re-running the MeanReversion EUR/GBP backtest with realistic spread (2 pips) and gap-through fills turned the previous "+$19.6k" headline into **-$2.9k with 19.3% max drawdown** (would fail FTMO daily-loss + total-drawdown). Walk-forward at spread=2 was profitable in only 1 of 4 windows. **MeanReversion is not a deployable strategy at current parameters.**
+
+**Deferred** (each is parked behind a specific trigger; pick it up when the trigger fires):
+
+- **B2 — Trailing drawdown for 1-Step Challenge**
+  - *Trigger:* before running the bot against a 1-Step FTMO account.
+  - *What:* 1-Step's total-drawdown floor is `max(challenge_start_balance, peak_EOD_equity) − 10%`, ratcheting up with profit. Today both `risk_guard.total_drawdown_pct()` and `Backtester._FTMO_LIMITS["1-step"]` compute drawdown vs the static starting balance (matches 2-Step only).
+  - *Where:* `risk_guard.py:total_drawdown_pct` + persisted state needs a `peak_eod_equity` field; `backtest.py:run()` FTMO check would need the same trailing peak.
+  - *Sources:* FTMO×OANDA MDL FAQ.
+
+- **B4 — Minimum trading days (≥4 per phase, 2-Step)**
+  - *Trigger:* as the bot approaches a profit target near phase-end, or before live deployment on any challenge.
+  - *What:* Track distinct trading days (UTC or Prague — match the FTMO timezone the rest of the guard uses). If the bot hits the profit target on day 1 and stops, FTMO auto-fails the phase. Need to either keep emitting at least one tiny trade per remaining day, or pause withdrawing-eligible behavior until day-4 is reached.
+  - *Where:* `risk_guard.py` — new persisted state field `trading_days_count` incremented in `record_position_entry`. Surface in `summary()` so `risk_status` shows it. Add a `min_trading_days_remaining()` helper.
+
+- **B5 — News blackout for funded Standard accounts**
+  - *Trigger:* before any account converts from Verification to Funded Standard. (2026 rules: no restriction in Challenge / Verification; ±2 min around major news on funded Standard; no restriction on funded Swing.)
+  - *What:* Maintain a calendar of high-impact events (manual CSV, or Forex Factory / ECB feed). Block `place_market_order` and pre-emptively close positions within the ±2-min window. SL/TP fills inside the window also count.
+  - *Where:* New `news_calendar.py` module; gate added in `oanda_api.place_market_order` and in `strategy_runner._handle_signal`. Likely needs a separate background poller to close before the window opens.
+
+- **B7 — Plan doc 1-Step vs 2-Step parameter split**
+  - *Trigger:* when this plan doc gets re-read by a fresh agent / on the next major doc cleanup.
+  - *What:* The "FTMO Constraints" section in `CLAUDE.md` and various Phase 3 notes currently cite 2-Step numbers as if they were universal. Split into a table that shows both columns: daily loss limit (5% / 3%), drawdown rule (static / trailing), min trading days (≥4 / not stated), best-day rule (funded-only / challenge+funded).
+
+- **C3 — SL slippage modeling beyond gap-through**
+  - *Trigger:* when the backtest result for any deployable strategy is close enough to break-even that 0.5-1 pip per SL hit matters (e.g., a profit factor between 1.0 and 1.2).
+  - *What:* On every SL fill (not just gap-through), add a configurable slippage (e.g., `sl_slippage_pips=0.5`) so the fill is N pips beyond the stop. Today only gap-through is modeled; intra-candle slippage from fast moves is invisible.
+  - *Where:* `backtest.py:_check_exit` — adjust the "sl" branch fill price by `+sl_slippage_pips * pip_size` (long) / `-` (short). Add `sl_slippage_pips` to `Backtester.__init__` + propagate through `WalkForwardAnalyzer`.
+
+- **D1 — `pip_size` allow-list for non-FX instruments**
+  - *Trigger:* before adding XAU/BTC/indices to `OANDA_INSTRUMENTS`. Currently `risk.pip_size` returns 0.0001 for anything non-JPY — gold uses 0.10, BTC uses 1.0, indices vary. Mis-sizing by 100×–100,000×.
+  - *What:* Replace the `_is_jpy_quote` heuristic in `risk.py` with an allow-list (`XAU_USD: 0.10`, `XAG_USD: 0.01`, `BTC_USD: 1.0`, indices per OANDA spec). Raise on unknown instruments rather than defaulting silently. Alternative: fetch instrument metadata from OANDA at startup and cache it.
+
+- **D2 — DST handling in LondonBreakout**
+  - *Trigger:* if LondonBreakout is revived as a viable strategy. Currently it had 0% profitable walk-forward windows on GBP/USD at default params and is de-prioritized.
+  - *What:* `LondonBreakoutStrategy` uses fixed UTC hours (8-10 = London BST = summer). In winter (GMT) London opens at 09:00 UTC, so the strategy fires an hour early for ~6 months. Convert the window to Europe/London zone and derive UTC hours per candle's date.
+  - *Where:* `london_breakout.py:on_candle_close` — replace `candle_hour` with `candle_dt.astimezone(ZoneInfo("Europe/London")).hour`.
+
+- **D3 — Mean Reversion signal hysteresis**
+  - *Trigger:* if Mean Reversion is revived (it's currently unprofitable at realistic spread). Now that A5 blocks stacking in the runner, the only impact would be on the very first re-entry after a position closes.
+  - *What:* After a BB-breach signal, require price to cross back inside the band before re-arming. Today `mean_reversion.py:on_candle_close` emits on every candle where `close < bb.lower and rsi < oversold` — fine while a position is open (A5 blocks), but as soon as that trade closes, the strategy can re-fire immediately.
+  - *Where:* `mean_reversion.py` — add `_armed_long` / `_armed_short` flags; flip them off after emission, flip back on when close crosses back through the band.
+
+- **D6 — Non-USD account-currency wiring**
+  - *Trigger:* if a FTMO account denominated in EUR / GBP / CZK is funded. The `account_currency` parameter already exists on `StrategyRunner.__init__` and `Backtester.__init__`; only the wiring is missing.
+  - *What:* Add `ACCOUNT_CURRENCY` env var to `config.py`; pull it from OANDA's account summary `currency` field on first refresh and warn if it doesn't match. Pass `config.ACCOUNT_CURRENCY` to `StrategyRunner` and `Backtester` instead of relying on the USD default.
+  - *Where:* `config.py`, `main.py` (the four places that construct these classes).
+
+**2026 FTMO rule changes (captured during the review):**
+- News restriction REMOVED for Challenge/Verification phases — only funded Standard accounts still have ±2-min window
+- 1-Step Challenge introduced (Feb 2026): 3% daily loss, 10% trailing drawdown (vs 2-Step's 5% / 10% static)
+- FTMO×OANDA: 42 forex + 6 other instruments, $200k max simulated account size
+
+---
+
 ## Phase 1: Core API Client ✅ DONE
 - OANDA v20 REST API connection (direct HTTP, no wrapper library)
 - Account summary, candle data, pricing, market orders, position management, transactions

@@ -1,5 +1,8 @@
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 
 GRANULARITY_SECONDS = {
@@ -126,5 +129,11 @@ class CandleAggregator:
         }
 
     def _emit_close(self, candle):
+        # Isolate per-callback exceptions: a bug in one consumer (e.g. a
+        # strategy runner) must not prevent other registered callbacks
+        # from seeing the candle close.
         for cb in self._callbacks:
-            cb(candle["granularity"], candle)
+            try:
+                cb(candle["granularity"], candle)
+            except Exception:
+                logger.exception("Candle-close callback raised; continuing")

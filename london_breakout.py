@@ -112,7 +112,9 @@ class LondonBreakoutStrategy(Strategy):
         if sl_pips <= 0 or tp_pips <= 0:
             return None
 
-        self._last_trade_date = candle_date
+        # Note: _last_trade_date is set in on_trade_filled, NOT here. Setting
+        # it eagerly would silently lock the strategy out for the rest of the
+        # day if the guard rejects the signal or OANDA returns a FOK cancel.
         return Signal(
             direction=direction,
             stop_loss_pips=sl_pips,
@@ -123,6 +125,10 @@ class LondonBreakoutStrategy(Strategy):
                 f"close={close} range_pips={int(range_pips)}"
             ),
         )
+
+    def on_trade_filled(self, signal, candle):
+        candle_dt = datetime.fromtimestamp(candle["start_time"], tz=timezone.utc)
+        self._last_trade_date = candle_dt.date()
 
     def _is_in_asian_session(self, candle, target_date):
         candle_dt = datetime.fromtimestamp(candle["start_time"], tz=timezone.utc)

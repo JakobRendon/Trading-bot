@@ -92,6 +92,15 @@ class Strategy(ABC):
         Return None to do nothing. Return a Signal to request a trade.
         """
 
+    def on_trade_filled(self, signal, candle):
+        """Called by the runner/backtester after a signal results in a fill.
+
+        Default is no-op. Strategies with one-per-day or post-fill state
+        (e.g., LondonBreakout's _last_trade_date) override this to commit
+        that state only after the order actually executed — so a guard
+        rejection or FOK cancel doesn't silently lock the strategy out.
+        """
+
 
 class FixedSignalStrategy(Strategy):
     """Wiring-test strategy: emits a fixed signal on every candle close.

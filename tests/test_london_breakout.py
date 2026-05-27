@@ -178,25 +178,45 @@ class TestRiskReward:
 # --- One trade per day ---
 
 class TestOnePerDay:
-    def test_second_signal_same_day_blocked(self):
+    def test_second_signal_same_day_blocked_after_fill(self):
+        # Once-per-day lockout activates on fill confirmation (on_trade_filled),
+        # not on signal emission — so a rejected/cancelled first signal does
+        # NOT silently block the rest of the day.
         s = LondonBreakoutStrategy(tp_multiplier=2)
         history = build_asian_session(high=1.2700, low=1.2650)
-        # First breakout at 08:00 (R:R-passing close)
         c1 = make_candle(8, 0, 1.2715, 1.2700, 1.2710)
         first = s.on_candle_close(c1, history)
         assert first is not None
+        # Simulate the runner confirming the fill
+        s.on_trade_filled(first, c1)
 
-        # Second breakout at 08:15 same day — should be blocked
         history_with_c1 = history + [c1]
         c2 = make_candle(8, 15, 1.2720, 1.2710, 1.2715)
         second = s.on_candle_close(c2, history_with_c1)
         assert second is None
 
+    def test_signal_without_fill_does_not_lock_out_day(self):
+        # If the first signal is rejected/cancelled (runner never calls
+        # on_trade_filled), the strategy should still be able to emit a
+        # later signal that day.
+        s = LondonBreakoutStrategy(tp_multiplier=2)
+        history = build_asian_session(high=1.2700, low=1.2650)
+        c1 = make_candle(8, 0, 1.2715, 1.2700, 1.2710)
+        first = s.on_candle_close(c1, history)
+        assert first is not None
+        # No on_trade_filled — pretend the runner rejected this one.
+
+        history_with_c1 = history + [c1]
+        c2 = make_candle(8, 15, 1.2720, 1.2710, 1.2715)
+        second = s.on_candle_close(c2, history_with_c1)
+        assert second is not None
+
     def test_next_day_can_trade_again(self):
         s = LondonBreakoutStrategy(tp_multiplier=2)
         history = build_asian_session(high=1.2700, low=1.2650)
         c1 = make_candle(8, 0, 1.2715, 1.2700, 1.2710)
-        s.on_candle_close(c1, history)  # marks today as traded
+        first = s.on_candle_close(c1, history)
+        s.on_trade_filled(first, c1)  # marks today as traded
 
         # Day 2: 24 hours later
         day2_start = DAY_START + 24 * 3600

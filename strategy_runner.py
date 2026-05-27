@@ -20,6 +20,8 @@ has been validated.
 """
 
 import logging
+from decimal import Decimal
+
 from oanda_api import OandaAPIError, OandaOrderRejected
 from risk import position_size
 
@@ -30,23 +32,72 @@ logger = logging.getLogger(__name__)
 
 
 class StrategyRunner:
-    def __init__(self, api, guard, strategy, paper=True, default_risk_pct=1.0):
+    def __init__(
+        self,
+        api,
+        guard,
+        strategy,
+        paper=True,
+        default_risk_pct=1.0,
+        account_currency="USD",
+    ):
         """
-        api: OandaAPI instance (only used when paper=False)
+        api: OandaAPI instance (used for orders and quote-to-account rate lookups)
         guard: FTMORiskGuard instance — used in both modes
         strategy: a Strategy subclass instance
         paper: if True, log signals without placing orders
         default_risk_pct: % of NAV to risk per trade when Signal.units is None
+        account_currency: currency of the OANDA account — required for accurate
+            position sizing on cross-currency pairs (e.g., EUR_GBP on a USD
+            account). The runner fetches a live rate from OANDA at signal time
+            when quote != account.
         """
         self.api = api
         self.guard = guard
         self.strategy = strategy
         self.paper = paper
         self.default_risk_pct = default_risk_pct
+        self.account_currency = account_currency
         # Rolling per-(instrument, granularity) history. Trimmed to history_size.
         self._history = {}
         # Trade activity recorded for visibility in paper mode + tests
         self.activity = []
+
+    def _quote_to_account_rate(self, instrument):
+        """Return the live rate to convert this instrument's quote currency
+        to the account currency, or None if quote already matches account.
+
+        Tries the direct pair (quote_account) first, then the inverted pair
+        (account_quote). Raises OandaAPIError if neither lookup succeeds.
+        """
+        if "_" not in instrument:
+            raise ValueError(f"Unrecognized instrument format: {instrument}")
+        quote = instrument.split("_")[1]
+        if quote == self.account_currency:
+            return None
+
+        def _mid(pair):
+            data = self.api.get_price(pair)
+            prices = data.get("prices", [])
+            if not prices:
+                return None
+            bid = Decimal(prices[0]["bids"][0]["price"])
+            ask = Decimal(prices[0]["asks"][0]["price"])
+            return (bid + ask) / Decimal(2)
+
+        direct = f"{quote}_{self.account_currency}"
+        try:
+            mid = _mid(direct)
+            if mid is not None:
+                return mid
+        except OandaAPIError:
+            pass
+
+        inverted = f"{self.account_currency}_{quote}"
+        mid = _mid(inverted)
+        if mid is None or mid <= 0:
+            raise OandaAPIError(0, f"No rate available for {quote}->{self.account_currency}")
+        return Decimal(1) / mid
 
     def on_candle_close(self, granularity, candle):
         """Callback wired to CandleAggregator.on_candle_close().
@@ -83,6 +134,21 @@ class StrategyRunner:
         self._handle_signal(signal, candle)
 
     def _handle_signal(self, signal, triggering_candle):
+        # Per-strategy "single open position" guard. Agent A flagged that
+        # MeanReversion can stack entries on consecutive candles when BB/RSI
+        # stay extreme — the global risk guard's 180-position cap is far
+        # above what any one strategy should pile up.
+        if self.guard.open_position_count() > 0:
+            event = {
+                "type": "blocked",
+                "signal": signal,
+                "reason": "position already open",
+                "triggered_at": triggering_candle.get("start_time"),
+            }
+            self.activity.append(event)
+            logger.info("Signal blocked: position already open (%s)", signal.reason)
+            return
+
         allowed, reason = self.guard.can_open_position()
         if not allowed:
             event = {
@@ -110,15 +176,29 @@ class StrategyRunner:
                 signal.take_profit_pips,
                 signal.reason,
             )
+            self.strategy.on_trade_filled(signal, triggering_candle)
             return
 
         # Live execution
         units = signal.units
         if units is None:
             nav = float(self.guard.summary()["current_nav"])
-            units = position_size(
-                nav, self.default_risk_pct, signal.stop_loss_pips, self.strategy.instrument
-            )
+            try:
+                rate = self._quote_to_account_rate(self.strategy.instrument)
+                units = position_size(
+                    nav,
+                    self.default_risk_pct,
+                    signal.stop_loss_pips,
+                    self.strategy.instrument,
+                    account_currency=self.account_currency,
+                    quote_to_account_rate=rate,
+                )
+            except (OandaAPIError, ValueError) as e:
+                event = {"type": "error", "signal": signal, "error": str(e)}
+                self.activity.append(event)
+                logger.error("Position sizing failed for %s: %s",
+                             self.strategy.instrument, e)
+                return
             if units == 0:
                 logger.warning(
                     "Computed position size is 0 for %s — skipping signal",
@@ -158,6 +238,7 @@ class StrategyRunner:
                 fill.get("price"),
                 fill.get("id"),
             )
+            self.strategy.on_trade_filled(signal, triggering_candle)
         elif "orderCancelTransaction" in response:
             cancel = response["orderCancelTransaction"]
             event = {

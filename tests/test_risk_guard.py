@@ -83,7 +83,7 @@ class TestInitialization:
         with open(state_path, "w") as f:
             json.dump({
                 "challenge_start_balance": "50000.00",
-                "daily_start_nav": "50000.00",
+                "daily_start_balance": "50000.00",
                 "daily_start_date": "2026-05-25",
                 "request_count_today": 0,
                 "api_request_count_last_seen": 0,
@@ -95,16 +95,17 @@ class TestInitialization:
         api = make_mock_api()
         guard = FTMORiskGuard(api, state_path=state_path)
         assert guard._state["challenge_start_balance"] == "50000.00"
-        assert guard._state["daily_start_nav"] == "50000.00"
+        assert guard._state["daily_start_balance"] == "50000.00"
 
-    def test_old_state_schema_migrates_daily_start_balance(self, state_path, fixed_today):
-        """Old state files used daily_start_balance — migrate to daily_start_nav."""
+    def test_old_state_schema_migrates_daily_start_nav(self, state_path, fixed_today):
+        """Interim state files used daily_start_nav (NAV anchor was reverted to
+        balance per FTMO MDL FAQ) — migrate the key transparently."""
         with open(state_path, "w") as f:
-            json.dump({"daily_start_balance": "50000.00"}, f)
+            json.dump({"daily_start_nav": "50000.00"}, f)
         api = make_mock_api()
         guard = FTMORiskGuard(api, state_path=state_path)
-        assert guard._state["daily_start_nav"] == "50000.00"
-        assert "daily_start_balance" not in guard._state
+        assert guard._state["daily_start_balance"] == "50000.00"
+        assert "daily_start_nav" not in guard._state
 
     def test_constructor_balance_overrides_persisted(self, state_path, fixed_today):
         with open(state_path, "w") as f:
@@ -278,18 +279,21 @@ class TestCanOpenPosition:
 # --- Daily rollover ---
 
 class TestDailyRollover:
-    def test_rollover_snapshots_new_daily_nav(self, state_path, monkeypatch):
-        """Anchor is NAV (not balance) so carried unrealized P/L doesn't distort daily P/L."""
-        # Day 1: NAV 25000
+    def test_rollover_snapshots_new_daily_balance(self, state_path, monkeypatch):
+        """Anchor is BALANCE (not NAV) per FTMO MDL FAQ. Unrealized P/L on a
+        position held across midnight counts against the daily loss limit —
+        anchoring on NAV would silently ignore that exposure."""
+        # Day 1: balance 25000
         monkeypatch.setattr(risk_guard, "_ftmo_today", lambda: "2026-05-25")
         api = make_mock_api(balance="25000.00", nav="25000.00")
         guard = FTMORiskGuard(api, state_path=state_path, challenge_start_balance=25000)
         guard.refresh()
-        assert guard._state["daily_start_nav"] == "25000.00"
+        assert guard._state["daily_start_balance"] == "25000.00"
         assert guard._state["daily_start_date"] == "2026-05-25"
 
-        # Day 2: balance is 25500 but NAV is 25800 (open position +300 unrealized)
-        # Anchor should be NAV (25800), not balance (25500).
+        # Day 2: balance is 25500 but NAV is 25800 (open position +300 unrealized).
+        # Anchor must be balance (25500). The +300 unrealized contributes to
+        # current NAV, so daily_pl = NAV - balance_anchor = 25800 - 25500 = +300.
         monkeypatch.setattr(risk_guard, "_ftmo_today", lambda: "2026-05-26")
         api.get_account_summary.side_effect = lambda: {
             "account": {
@@ -301,7 +305,7 @@ class TestDailyRollover:
         }
         guard.invalidate_cache()
         guard.refresh()
-        assert guard._state["daily_start_nav"] == "25800.00"
+        assert guard._state["daily_start_balance"] == "25500.00"
         assert guard._state["daily_start_date"] == "2026-05-26"
 
     def test_request_counter_accumulates_within_day(self, state_path, monkeypatch):

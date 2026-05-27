@@ -26,7 +26,19 @@ GRANULARITIES = _parse_list("OANDA_GRANULARITIES", "M5,M15,H1,H4")
 # Buffers are deliberately below FTMO's hard limits to leave headroom.
 RISK_STATE_PATH = os.getenv("RISK_STATE_PATH", "risk_state.json")
 CHALLENGE_START_BALANCE = os.getenv("CHALLENGE_START_BALANCE") or None
-DAILY_LOSS_BUFFER_PCT = float(os.getenv("DAILY_LOSS_BUFFER_PCT", "4"))
+
+# Challenge type: "2-step" (5% daily, 10% static drawdown) or "1-step"
+# (3% daily, 10% trailing drawdown). FTMO introduced the 1-Step in Feb 2026.
+CHALLENGE_TYPE = os.getenv("CHALLENGE_TYPE", "2-step").lower()
+if CHALLENGE_TYPE not in ("1-step", "2-step"):
+    raise ValueError(
+        f"CHALLENGE_TYPE must be '1-step' or '2-step', got: {CHALLENGE_TYPE!r}"
+    )
+
+# Default buffers sit 1% under each challenge's hard limit. Override via
+# env var for tighter / looser headroom.
+_DEFAULT_DAILY_BUFFER = {"1-step": 2.0, "2-step": 4.0}[CHALLENGE_TYPE]
+DAILY_LOSS_BUFFER_PCT = float(os.getenv("DAILY_LOSS_BUFFER_PCT", str(_DEFAULT_DAILY_BUFFER)))
 TOTAL_DRAWDOWN_BUFFER_PCT = float(os.getenv("TOTAL_DRAWDOWN_BUFFER_PCT", "9"))
 MAX_REQUESTS_PER_DAY = int(os.getenv("MAX_REQUESTS_PER_DAY", "1900"))
 MAX_POSITION_ENTRIES_PER_DAY = int(os.getenv("MAX_POSITION_ENTRIES_PER_DAY", "1900"))

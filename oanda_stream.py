@@ -1,6 +1,9 @@
 import json
+import logging
 import time
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 # OANDA sends heartbeats every 5 seconds. A 10s socket timeout doubles that
@@ -85,12 +88,26 @@ class OandaStream:
 
                             received_data = True
                             event_type = data.get("type")
+                            # Isolate per-callback exceptions: a single bad
+                            # callback must not kill the iter_lines loop,
+                            # because that would silently take down every
+                            # other downstream consumer of the stream.
                             if event_type == "PRICE":
                                 for cb in self.price_callbacks:
-                                    cb(data)
+                                    try:
+                                        cb(data)
+                                    except Exception:
+                                        logger.exception(
+                                            "Price callback raised; continuing"
+                                        )
                             elif event_type == "HEARTBEAT":
                                 for cb in self.heartbeat_callbacks:
-                                    cb(data)
+                                    try:
+                                        cb(data)
+                                    except Exception:
+                                        logger.exception(
+                                            "Heartbeat callback raised; continuing"
+                                        )
 
                         # iter_lines exited without exception — server closed
                         # the connection cleanly. Reconnect with backoff.

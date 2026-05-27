@@ -20,10 +20,11 @@ def make_candle(instrument="EUR_USD", granularity="M1", close="1.10000", start_t
     }
 
 
-def make_guard(allowed=True, reason="", nav="25000.00"):
+def make_guard(allowed=True, reason="", nav="25000.00", open_positions=0):
     g = MagicMock()
     g.can_open_position = MagicMock(return_value=(allowed, reason))
     g.summary = MagicMock(return_value={"current_nav": nav})
+    g.open_position_count = MagicMock(return_value=open_positions)
     g.record_position_entry = MagicMock()
     return g
 

@@ -94,6 +94,7 @@ class FTMORiskGuard:
         api,
         state_path="risk_state.json",
         challenge_start_balance=None,
+        challenge_type="2-step",
         daily_loss_buffer_pct=4,
         total_drawdown_buffer_pct=9,
         max_requests_per_day=1900,
@@ -101,8 +102,13 @@ class FTMORiskGuard:
         max_simultaneous_positions=180,
         refresh_ttl_seconds=10,
     ):
+        if challenge_type not in ("1-step", "2-step"):
+            raise ValueError(
+                f"challenge_type must be '1-step' or '2-step', got: {challenge_type!r}"
+            )
         self.api = api
         self.state_path = state_path
+        self.challenge_type = challenge_type
         self.daily_loss_buffer_pct = Decimal(str(daily_loss_buffer_pct))
         self.total_drawdown_buffer_pct = Decimal(str(total_drawdown_buffer_pct))
         self.max_requests_per_day = max_requests_per_day
@@ -144,7 +150,11 @@ class FTMORiskGuard:
         return {
             "schema_version": 1,
             "challenge_start_balance": None,
-            "daily_start_nav": None,
+            # FTMO's Max Daily Loss is measured as Equity vs the BALANCE
+            # recorded at 00:00 CE(S)T (not NAV). See FTMO MDL FAQ. A prior
+            # iteration anchored on NAV; this was less conservative than
+            # FTMO's actual rule and could miss the hard limit.
+            "daily_start_balance": None,
             "daily_start_date": None,
             "request_count_today": 0,
             "api_request_count_last_seen": 0,
@@ -169,9 +179,12 @@ class FTMORiskGuard:
                 pass
             print(f"Risk state file corrupted ({e}); moved to {backup}, starting fresh")
             return defaults
-        # Backfill missing keys (forward-compatibility) and migrate old key names
-        if "daily_start_balance" in state and "daily_start_nav" not in state:
-            state["daily_start_nav"] = state.pop("daily_start_balance")
+        # Backfill missing keys (forward-compatibility) and migrate old key names.
+        # daily_start_nav was the (incorrect) anchor during a brief window;
+        # transparently rename it. The next daily rollover re-anchors to
+        # balance, so any short-term inaccuracy self-heals within 24h.
+        if "daily_start_nav" in state and "daily_start_balance" not in state:
+            state["daily_start_balance"] = state.pop("daily_start_nav")
         if "request_count_baseline" in state and "request_count_today" not in state:
             # Old schema — discard the baseline; reset today's count
             state["request_count_today"] = 0
@@ -182,8 +195,8 @@ class FTMORiskGuard:
         state["challenge_start_balance"] = _validated_decimal_str(
             state["challenge_start_balance"], "challenge_start_balance"
         )
-        state["daily_start_nav"] = _validated_decimal_str(
-            state["daily_start_nav"], "daily_start_nav"
+        state["daily_start_balance"] = _validated_decimal_str(
+            state["daily_start_balance"], "daily_start_balance"
         )
         return state
 
@@ -249,10 +262,14 @@ class FTMORiskGuard:
             if self._state["challenge_start_balance"] is None:
                 self._state["challenge_start_balance"] = str(self._balance)
 
-            # Daily rollover: anchor to NAV (not balance) so carried unrealized
-            # P/L doesn't distort today's P/L calculation.
+            # Daily rollover: anchor to BALANCE (not NAV). Per FTMO's MDL
+            # rule, the daily loss = balance_at_00:00_CEST minus current
+            # equity. NAV-anchored is less conservative than FTMO's actual
+            # calc — a position carrying unrealized loss at midnight would
+            # be ignored, allowing the real FTMO limit to be tripped before
+            # our local guard fires.
             if self._state["daily_start_date"] != today:
-                self._state["daily_start_nav"] = str(self._nav)
+                self._state["daily_start_balance"] = str(self._balance)
                 self._state["daily_start_date"] = today
 
             # Request counter: persist a running total in state so it survives
@@ -305,17 +322,21 @@ class FTMORiskGuard:
     # ---- metrics ----
 
     def daily_pl(self):
-        """Signed daily P/L in account currency (positive = profit)."""
+        """Signed daily P/L: current equity (NAV) minus today's balance anchor.
+
+        Anchor = balance at 00:00 CE(S)T (FTMO's MDL reference). Current =
+        NAV so unrealized P/L is included, matching FTMO's calculation.
+        """
         with self._lock:
             self._ensure_fresh()
-            start = Decimal(self._state["daily_start_nav"])
+            start = Decimal(self._state["daily_start_balance"])
             return self._nav - start
 
     def daily_loss_pct(self):
-        """Daily loss as a positive percent of daily start NAV, or 0 if in profit."""
+        """Daily loss as a positive percent of daily start balance, or 0 if in profit."""
         with self._lock:
             self._ensure_fresh()
-            start = Decimal(self._state["daily_start_nav"])
+            start = Decimal(self._state["daily_start_balance"])
             if start <= 0:
                 return Decimal("0")
             loss = start - self._nav
@@ -431,8 +452,9 @@ class FTMORiskGuard:
         with self._lock:
             self._ensure_fresh()
             return {
+                "challenge_type": self.challenge_type,
                 "challenge_start_balance": self._state["challenge_start_balance"],
-                "daily_start_nav": self._state["daily_start_nav"],
+                "daily_start_balance": self._state["daily_start_balance"],
                 "current_nav": str(self._nav) if self._nav is not None else None,
                 "daily_pl": str(self.daily_pl()) if self._nav is not None else None,
                 "daily_loss_pct": f"{self.daily_loss_pct():.2f}",

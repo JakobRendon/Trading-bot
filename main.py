@@ -24,6 +24,7 @@ guard = FTMORiskGuard(
     api,
     state_path=config.RISK_STATE_PATH,
     challenge_start_balance=config.CHALLENGE_START_BALANCE,
+    challenge_type=config.CHALLENGE_TYPE,
     daily_loss_buffer_pct=config.DAILY_LOSS_BUFFER_PCT,
     total_drawdown_buffer_pct=config.TOTAL_DRAWDOWN_BUFFER_PCT,
     max_requests_per_day=config.MAX_REQUESTS_PER_DAY,
@@ -347,6 +348,23 @@ def backtest_strategy():
     except (ValueError, ArithmeticError):
         print("  Invalid balance.")
         return
+    spread_input = input("  Spread (pips, round-trip) [2]: ").strip() or "2"
+    try:
+        spread_pips = float(spread_input)
+    except ValueError:
+        print("  Invalid spread.")
+        return
+    rate_input = input(
+        "  quote_to_account_rate (blank if quote == account currency): "
+    ).strip()
+    if rate_input:
+        try:
+            quote_rate = Decimal(rate_input)
+        except (ValueError, ArithmeticError):
+            print("  Invalid rate.")
+            return
+    else:
+        quote_rate = None
 
     from datetime import datetime, timedelta, timezone
     to_dt = datetime.now(timezone.utc)
@@ -363,8 +381,14 @@ def backtest_strategy():
 
     candles = [normalize_oanda_candle(c, INSTRUMENT, granularity) for c in oanda_candles]
     strategy = strategy_factory()
-    result = Backtester(strategy, starting_balance=starting_balance).run(candles)
-    print(f"  Strategy: {type(strategy).__name__}")
+    result = Backtester(
+        strategy,
+        starting_balance=starting_balance,
+        spread_pips=spread_pips,
+        quote_to_account_rate=quote_rate,
+        challenge_type=config.CHALLENGE_TYPE,
+    ).run(candles)
+    print(f"  Strategy: {type(strategy).__name__}  (spread {spread_pips} pips)")
     print()
     print(result.summary())
 
@@ -384,6 +408,23 @@ def walk_forward_strategy():
     except ValueError:
         print("  Invalid input.")
         return
+    spread_input = input("  Spread (pips, round-trip) [2]: ").strip() or "2"
+    try:
+        spread_pips = float(spread_input)
+    except ValueError:
+        print("  Invalid spread.")
+        return
+    rate_input = input(
+        "  quote_to_account_rate (blank if quote == account currency): "
+    ).strip()
+    if rate_input:
+        try:
+            quote_rate = Decimal(rate_input)
+        except (ValueError, ArithmeticError):
+            print("  Invalid rate.")
+            return
+    else:
+        quote_rate = None
 
     from datetime import datetime, timedelta, timezone
     to_dt = datetime.now(timezone.utc)
@@ -405,6 +446,9 @@ def walk_forward_strategy():
         strategy_factory=strategy_factory,
         starting_balance=Decimal("25000"),
         risk_pct=1.0,
+        spread_pips=spread_pips,
+        quote_to_account_rate=quote_rate,
+        challenge_type=config.CHALLENGE_TYPE,
     )
     result = analyzer.run(candles, window_size=window_candles, warmup=cpd)
 
@@ -419,9 +463,10 @@ def walk_forward_strategy():
         end = _dt.fromtimestamp(w.end_time, tz=_tz.utc).date()
         r = w.result
         pf = f"{r.profit_factor:.2f}" if r.profit_factor else "N/A"
+        ftmo = f" FTMO:{r.ftmo_status}" if r.ftmo_check_enabled else ""
         print(
             f"  Window {i} ({start}..{end}): trades={r.num_trades:>2} "
-            f"win={r.win_rate * 100:>4.0f}% PF={pf:>5} P/L={r.total_pl:>8.0f}"
+            f"win={r.win_rate * 100:>4.0f}% PF={pf:>5} P/L={r.total_pl:>8.0f}{ftmo}"
         )
 
 
@@ -429,6 +474,7 @@ def walk_forward_strategy():
 def risk_status():
     s = guard.summary()
     allowed, reason = guard.can_open_position()
+    print(f"  Challenge type:          {s['challenge_type']}")
     print(f"  Challenge start balance: {s['challenge_start_balance']}")
     print(f"  Daily start balance:     {s['daily_start_balance']}")
     print(f"  Current NAV:             {s['current_nav']}")
