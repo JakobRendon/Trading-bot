@@ -11,6 +11,7 @@ from risk_guard import FTMORiskGuard
 from strategy import FixedSignalStrategy
 from strategy_runner import StrategyRunner
 from london_breakout import LondonBreakoutStrategy
+from mean_reversion import MeanReversionStrategy
 from backtest import Backtester, WalkForwardAnalyzer, normalize_oanda_candle
 
 # Use the first configured instrument for single-instrument menu actions.
@@ -275,19 +276,24 @@ def stream_candles():
     print("  Stream stopped.")
 
 
-@safe
-def run_strategy():
-    """Run a strategy in paper mode against the live stream.
-
-    Choose between the wiring-verification FixedSignalStrategy (emits every
-    candle close, useful for short-session debugging) and LondonBreakoutStrategy
-    (real strategy; fires at most once per day during 08:00-10:00 UTC).
-    """
+def _pick_strategy(instrument):
+    """Prompt for a strategy choice and return (strategy_factory, granularity)."""
     print("  Strategies:")
     print("    1. FixedSignalStrategy (M1, wiring test — fires every candle)")
     print("    2. LondonBreakoutStrategy (M15, real — fires 08-10 UTC max once/day)")
-    choice = input("  Pick [1]: ").strip() or "1"
+    print("    3. MeanReversionStrategy (H1, BB + RSI extremes)")
+    choice = input("  Pick [2]: ").strip() or "2"
+    if choice == "1":
+        return (lambda: FixedSignalStrategy(instrument=instrument, granularity="M1")), "M1"
+    if choice == "3":
+        return (lambda: MeanReversionStrategy(instrument=instrument, granularity="H1")), "H1"
+    return (lambda: LondonBreakoutStrategy(instrument=instrument)), "M15"
 
+
+@safe
+def run_strategy():
+    """Run a strategy in paper mode against the live stream."""
+    strategy_factory, granularity = _pick_strategy(INSTRUMENT)
     duration_input = input("  Run for how many seconds? [120]: ").strip() or "120"
     try:
         duration = int(duration_input)
@@ -295,18 +301,12 @@ def run_strategy():
         print("  Invalid duration.")
         return
 
-    if choice == "2":
-        strategy = LondonBreakoutStrategy(instrument=INSTRUMENT)
-        print(f"  Running LondonBreakoutStrategy on {INSTRUMENT} (M15) in PAPER mode.")
-        granularities = ["M15"]
-    else:
-        strategy = FixedSignalStrategy(instrument=INSTRUMENT, granularity="M1")
-        print(f"  Running FixedSignalStrategy on {INSTRUMENT} (M1) in PAPER mode.")
-        granularities = ["M1"]
+    strategy = strategy_factory()
+    print(f"  Running {type(strategy).__name__} on {INSTRUMENT} ({granularity}) in PAPER mode.")
 
     runner = StrategyRunner(api, guard, strategy, paper=True)
     stream = OandaStream(config.API_TOKEN, config.ACCOUNT_ID, config.BASE_URL)
-    aggregator = CandleAggregator(granularities)
+    aggregator = CandleAggregator([granularity])
     aggregator.on_candle_close(runner.on_candle_close)
     stream.on_price(aggregator.on_tick)
 
@@ -332,9 +332,10 @@ def run_strategy():
 
 
 @safe
-def backtest_london_breakout():
-    """Run a historical backtest of LondonBreakoutStrategy on OANDA M15 data."""
-    days_input = input("  How many days of history? [60]: ").strip() or "60"
+def backtest_strategy():
+    """Run a historical backtest of a chosen strategy on OANDA candles."""
+    strategy_factory, granularity = _pick_strategy(INSTRUMENT)
+    days_input = input("  How many days of history? [180]: ").strip() or "180"
     try:
         days = int(days_input)
     except ValueError:
@@ -353,27 +354,28 @@ def backtest_london_breakout():
     from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"  Fetching {INSTRUMENT} M15 candles from {from_iso} to {to_iso}...")
-    oanda_candles = api.get_candles_range(INSTRUMENT, "M15", from_iso, to_iso)
+    print(f"  Fetching {INSTRUMENT} {granularity} candles ({days} days)...")
+    oanda_candles = api.get_candles_range(INSTRUMENT, granularity, from_iso, to_iso)
     print(f"  Got {len(oanda_candles)} candles.")
     if not oanda_candles:
         print("  No candles returned.")
         return
 
-    candles = [normalize_oanda_candle(c, INSTRUMENT, "M15") for c in oanda_candles]
-    strategy = LondonBreakoutStrategy(instrument=INSTRUMENT)
+    candles = [normalize_oanda_candle(c, INSTRUMENT, granularity) for c in oanda_candles]
+    strategy = strategy_factory()
     result = Backtester(strategy, starting_balance=starting_balance).run(candles)
+    print(f"  Strategy: {type(strategy).__name__}")
     print()
     print(result.summary())
 
 
-@safe
-def walk_forward_london_breakout():
-    """Walk-forward analysis of LondonBreakoutStrategy across rolling test windows.
+_CANDLES_PER_DAY = {"M1": 1440, "M5": 288, "M15": 96, "M30": 48, "H1": 24, "H4": 6, "D": 1}
 
-    Surfaces strategy regime-sensitivity: a strategy that wins on some windows
-    but loses on others isn't robust, even if its overall P/L looks acceptable.
-    """
+
+@safe
+def walk_forward_strategy():
+    """Walk-forward analysis of a chosen strategy across rolling test windows."""
+    strategy_factory, granularity = _pick_strategy(INSTRUMENT)
     days_input = input("  Total history (days)? [180]: ").strip() or "180"
     window_days_input = input("  Test window size (days)? [30]: ").strip() or "30"
     try:
@@ -389,24 +391,24 @@ def walk_forward_london_breakout():
     from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"  Fetching {INSTRUMENT} M15 candles ({days} days)...")
-    oanda_candles = api.get_candles_range(INSTRUMENT, "M15", from_iso, to_iso)
+    print(f"  Fetching {INSTRUMENT} {granularity} candles ({days} days)...")
+    oanda_candles = api.get_candles_range(INSTRUMENT, granularity, from_iso, to_iso)
     print(f"  Got {len(oanda_candles)} candles.")
     if not oanda_candles:
         return
 
-    candles = [normalize_oanda_candle(c, INSTRUMENT, "M15") for c in oanda_candles]
-
-    # M15: 96 candles/day. Window size in candles:
-    window_candles = window_days * 96
+    candles = [normalize_oanda_candle(c, INSTRUMENT, granularity) for c in oanda_candles]
+    cpd = _CANDLES_PER_DAY.get(granularity, 96)
+    window_candles = window_days * cpd
 
     analyzer = WalkForwardAnalyzer(
-        strategy_factory=lambda: LondonBreakoutStrategy(instrument=INSTRUMENT),
+        strategy_factory=strategy_factory,
         starting_balance=Decimal("25000"),
         risk_pct=1.0,
     )
-    result = analyzer.run(candles, window_size=window_candles, warmup=96)
+    result = analyzer.run(candles, window_size=window_candles, warmup=cpd)
 
+    print(f"  Strategy: {type(strategy_factory()).__name__}")
     print()
     print(result.summary())
     print()
@@ -477,8 +479,8 @@ MENU = """
 9. Stream + aggregate candles
 10. Risk status
 11. Run strategy (paper mode)
-12. Backtest London Breakout
-13. Walk-forward London Breakout
+12. Backtest a strategy
+13. Walk-forward a strategy
 14. Exit
 """
 
@@ -494,8 +496,8 @@ ACTIONS = {
     "9": stream_candles,
     "10": risk_status,
     "11": run_strategy,
-    "12": backtest_london_breakout,
-    "13": walk_forward_london_breakout,
+    "12": backtest_strategy,
+    "13": walk_forward_strategy,
 }
 
 

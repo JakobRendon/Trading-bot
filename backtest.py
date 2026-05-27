@@ -169,11 +169,21 @@ class Backtester:
         starting_balance=Decimal("25000"),
         risk_pct=1.0,
         account_currency="USD",
+        quote_to_account_rate=None,
     ):
+        """
+        quote_to_account_rate: when the instrument's quote currency differs
+            from `account_currency` (e.g., USD_JPY on USD account → quote is JPY),
+            this is required to size positions correctly. Pass an approximate
+            historical rate; using a single fixed rate over a multi-month
+            backtest is inexact but acceptable for Phase 5 validation.
+            For matching quote/account currency (e.g., EUR_USD on USD), leave None.
+        """
         self.strategy = strategy
         self.starting_balance = Decimal(str(starting_balance))
         self.risk_pct = risk_pct
         self.account_currency = account_currency
+        self.quote_to_account_rate = quote_to_account_rate
 
     def run(self, candles) -> BacktestResult:
         """Replay candles chronologically, simulating fills and exits."""
@@ -248,6 +258,7 @@ class Backtester:
                     signal.stop_loss_pips,
                     self.strategy.instrument,
                     account_currency=self.account_currency,
+                    quote_to_account_rate=self.quote_to_account_rate,
                 )
             except ValueError:
                 return None  # e.g., cross-currency pair needing explicit rate
@@ -304,21 +315,31 @@ class Backtester:
     def _compute_pl(self, trade) -> Decimal:
         """P/L in account currency.
 
-        Assumes quote currency == account currency. For mismatched pairs
-        (e.g., USD_JPY on USD account), the result is in JPY and needs
-        conversion — deferred to full Phase 6.
+        Raw P/L is in the instrument's quote currency. When quote != account
+        currency (e.g., USD_JPY on USD account), we multiply by
+        `quote_to_account_rate` to convert. Single-rate approximation across
+        the backtest window — exact daily rates are a Phase 6 enhancement.
         """
         diff = trade.exit_price - trade.entry_price
         if not trade.is_long:
             diff = -diff
-        return diff * Decimal(trade.units)
+        pl_quote = diff * Decimal(trade.units)
+        if self.quote_to_account_rate is not None:
+            return pl_quote * Decimal(str(self.quote_to_account_rate))
+        return pl_quote
 
     def _mark_to_market(self, trade, current_price) -> Decimal:
-        """Unrealized P/L at current_price (for equity curve tracking)."""
+        """Unrealized P/L at current_price (for equity curve tracking).
+
+        Same quote→account conversion as _compute_pl.
+        """
         diff = current_price - trade.entry_price
         if not trade.is_long:
             diff = -diff
-        return diff * Decimal(trade.units)
+        pl_quote = diff * Decimal(trade.units)
+        if self.quote_to_account_rate is not None:
+            return pl_quote * Decimal(str(self.quote_to_account_rate))
+        return pl_quote
 
 
 # --- Walk-forward analysis ---
@@ -428,11 +449,13 @@ class WalkForwardAnalyzer:
         starting_balance=Decimal("25000"),
         risk_pct=1.0,
         account_currency="USD",
+        quote_to_account_rate=None,
     ):
         self.strategy_factory = strategy_factory
         self.starting_balance = Decimal(str(starting_balance))
         self.risk_pct = risk_pct
         self.account_currency = account_currency
+        self.quote_to_account_rate = quote_to_account_rate
 
     def run(
         self,
@@ -469,6 +492,7 @@ class WalkForwardAnalyzer:
                 starting_balance=self.starting_balance,
                 risk_pct=self.risk_pct,
                 account_currency=self.account_currency,
+                quote_to_account_rate=self.quote_to_account_rate,
             )
             raw_result = backtester.run(chunk)
 

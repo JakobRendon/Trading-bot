@@ -210,6 +210,29 @@ class TestBacktesterBehavior:
         assert result.num_trades == 0
         assert result.final_balance == Decimal("25000")
 
+    def test_quote_to_account_rate_converts_pl(self):
+        """USD_JPY on a USD account: raw P/L is in JPY, must convert via rate."""
+        # Entry 150.000, TP +40 pips = 150.400, units 1000
+        # Raw P/L in JPY = 0.400 * 1000 = 400 JPY
+        # At rate 0.0067 USD/JPY: 400 * 0.0067 = 2.68 USD
+        class JPYStrategy(OneShotLongStrategy):
+            @property
+            def instrument(self):
+                return "USD_JPY"
+        candles = [
+            make_candle(0, 149.99, 150.02, 149.99, 150.00, instrument="USD_JPY"),
+            make_candle(60, 150.00, 150.50, 149.99, 150.40, instrument="USD_JPY"),
+        ]
+        strategy = JPYStrategy(sl_pips=20, tp_pips=40)
+        result = Backtester(
+            strategy, starting_balance=Decimal("25000"),
+            quote_to_account_rate=Decimal("0.0067"),
+        ).run(candles)
+        trade = result.trades[0]
+        assert trade.exit_reason == "tp"
+        # 0.400 (JPY pips) * 1000 (units) * 0.0067 (rate) = 2.68 USD
+        assert abs(trade.pl - Decimal("2.68")) < Decimal("0.01")
+
 
 # --- Result metrics ---
 
